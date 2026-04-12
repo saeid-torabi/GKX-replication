@@ -1,0 +1,18 @@
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+
+# Local environments
+.venv/
+venv/
+
+# Generated outputs
+outputs/
+
+# Large local data artifacts
+*.parquet
+data_csv/
+data_in_case_needed/
+
+# Notebook exports and scratch files
+*.html
