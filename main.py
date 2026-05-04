@@ -2,8 +2,8 @@ import argparse
 import json
 import time
 from pathlib import Path
-
 import pandas as pd
+import matplotlib.pyplot as plt
 
 from backtest import annualized_sharpe_ratio, build_long_short_deciles
 from data_generator import GKXDataGenerator
@@ -18,6 +18,34 @@ def _metadata_cols(weight_col):
     if weight_col:
         base_cols.append(weight_col)
     return base_cols
+
+
+def _plot_wealth_growth(long_short, output_dir):
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required to plot wealth growth. "
+            "Install it with `pip install matplotlib`."
+        )
+
+    wealth_df = long_short.copy()
+    wealth_df["date"] = pd.to_datetime(
+        wealth_df["YYYYMM"].astype(str),
+        format="%Y%m",
+    )
+    wealth_df["wealth"] = (1 + wealth_df["long_short_10_1"]).cumprod()
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(wealth_df["date"], wealth_df["wealth"], linewidth=2)
+    plt.title("Cumulative Wealth Growth")
+    plt.ylabel("Portfolio Value ($)")
+    plt.grid(True, alpha=0.3)
+
+    output_path = output_dir / "wealth_growth.png"
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close()
+
+    return output_path
 
 
 def main():
@@ -211,6 +239,7 @@ def main():
 
     split_results_df = pd.DataFrame(split_results)
     long_short_sharpe = annualized_sharpe_ratio(long_short["long_short_10_1"])
+    wealth_plot_path = _plot_wealth_growth(long_short, output_dir)
 
     predictions_path = output_dir / f"{args.model.lower()}_predictions.parquet"
     split_results_path = output_dir / f"{args.model.lower()}_split_results.csv"
@@ -243,6 +272,7 @@ def main():
     print(f"Overall OOS R^2: {summary['overall_oos_r2']:.6f}")
     print(f"Long-short decile Sharpe: {long_short_sharpe:.6f}")
     print(f"Predictions saved to {predictions_path}")
+    print(f"Wealth growth plot saved to {wealth_plot_path}")
     print("=" * 72)
 
 

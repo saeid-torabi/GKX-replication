@@ -8,11 +8,13 @@ venv/
 
 # Generated outputs
 outputs/
+reports_and_updates/
 
 # Large local data artifacts
 *.parquet
 data_csv/
 data_in_case_needed/
+__pycache__/
 
 # Notebook exports and scratch files
 *.html

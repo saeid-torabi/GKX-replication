@@ -26,28 +26,28 @@ The portfolio backtest currently forms monthly long-short decile portfolios from
 
 ## Repository Structure
 
-- [data_wrangling.ipynb](/Users/shadowform/Documents/%23Unito/CodesAndProjects/thesis_replication/data_wrangling.ipynb)
+- [data_wrangling.ipynb](./data_wrangling.ipynb)
   Builds the cleaned base panel and saves it to parquet.
 
-- [data_generator.py](/Users/shadowform/Documents/%23Unito/CodesAndProjects/thesis_replication/data_generator.py)
+- [data_generator.py](./data_generator.py)
   Streams the base parquet in batches and constructs the 920 predictors on the fly.
 
-- [models.py](/Users/shadowform/Documents/%23Unito/CodesAndProjects/thesis_replication/models.py)
+- [models.py](./models.py)
   Defines the feed-forward neural network architectures.
 
-- [train.py](/Users/shadowform/Documents/%23Unito/CodesAndProjects/thesis_replication/train.py)
+- [train.py](./train.py)
   Handles model fitting, validation loss evaluation, and out-of-sample prediction.
 
-- [splits.py](/Users/shadowform/Documents/%23Unito/CodesAndProjects/thesis_replication/splits.py)
+- [splits.py](./splits.py)
   Generates recursive train/validation/test windows.
 
-- [evaluate.py](/Users/shadowform/Documents/%23Unito/CodesAndProjects/thesis_replication/evaluate.py)
+- [evaluate.py](./evaluate.py)
   Computes out-of-sample predictive metrics such as stock-level \(R^2_{oos}\).
 
-- [backtest.py](/Users/shadowform/Documents/%23Unito/CodesAndProjects/thesis_replication/backtest.py)
+- [backtest.py](./backtest.py)
   Builds decile portfolios from out-of-sample predictions and computes long-short performance.
 
-- [main.py](/Users/shadowform/Documents/%23Unito/CodesAndProjects/thesis_replication/main.py)
+- [main.py](./main.py)
   Main experiment entrypoint.
 
 ## Data Workflow

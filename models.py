@@ -48,8 +48,8 @@ def build_neural_net(architecture, input_features):
         "NN1": {"hidden_layers": [32], "dropout": 0.0},
         "NN2": {"hidden_layers": [32, 16], "dropout": 0.0},
         "NN3": {"hidden_layers": [32, 16, 8], "dropout": 0.0},
-        "NN4": {"hidden_layers": [64, 32, 16, 8], "dropout": 0.0},
-        "NN5": {"hidden_layers": [64, 32, 16, 8, 4], "dropout": 0.0},
+        "NN4": {"hidden_layers": [32, 16, 8, 4], "dropout": 0.0},
+        "NN5": {"hidden_layers": [32, 16, 8, 4, 2], "dropout": 0.0},
     }
 
     if architecture not in configs:
