@@ -1,6 +1,6 @@
 import math
-
 import numpy as np
+import pandas as pd
 
 try:
     import pyarrow.dataset as ds
@@ -21,7 +21,7 @@ else:
     _TORCH_IMPORT_ERROR = None
 
 
-ID_COLS = {"permno", "YYYYMM", "sic2", "excess_ret"}
+ID_COLS = {"permno", "YYYYMM", "sic2", "excess_ret", "market_cap"}
 MACRO_PREFIX = "macro_"
 SIC_PREFIX = "sic2_"
 
@@ -48,6 +48,8 @@ class GKXDataGenerator:
         date_end=None,
         return_metadata=False,
         metadata_cols=None,
+        shuffle=False,
+        shuffle_buffer_batches=8,
     ):
         if pq is None or ds is None:
             raise ImportError(
@@ -68,6 +70,10 @@ class GKXDataGenerator:
         self.date_end = date_end
         self.return_metadata = return_metadata
         self.metadata_cols = metadata_cols or [date_col, "permno"]
+        self.shuffle = shuffle
+        self.shuffle_buffer_batches = shuffle_buffer_batches
+        if self.shuffle and self.shuffle_buffer_batches < 1:
+            raise ValueError("shuffle_buffer_batches must be at least 1 when shuffle=True.")
 
         # Read schema once from parquet metadata, but iterate through a dataset
         # scanner so we can push time-window filters into the file reader.
@@ -97,6 +103,8 @@ class GKXDataGenerator:
             )
         print(f"  -> Total rows available: {self.total_rows:,}")
         print(f"  -> Batch size: {self.batch_size:,}")
+        if self.shuffle:
+            print(f"  -> Shuffle buffer: {self.shuffle_buffer_batches} batches")
         print(
             "  -> Feature blocks: "
             f"{len(self.char_cols)} chars, "
@@ -160,9 +168,9 @@ class GKXDataGenerator:
         if not self.dummy_cols:
             raise ValueError("No SIC2 dummy columns were detected.")
 
-    def __iter__(self):
+    def _iter_ordered_batches(self):
         """
-        Yield one batch of PyTorch tensors at a time.
+        Yield one ordered batch of PyTorch tensors at a time.
         """
         columns_to_read = (
             self.char_cols
@@ -228,6 +236,47 @@ class GKXDataGenerator:
                 yield x_tensor, y_tensor, metadata_df
             else:
                 yield x_tensor, y_tensor
+
+    def _flush_shuffle_buffer(self, buffer):
+        if self.return_metadata:
+            x_tensor = torch.cat([item[0] for item in buffer], dim=0)
+            y_tensor = torch.cat([item[1] for item in buffer], dim=0)
+            metadata_df = pd.concat([item[2] for item in buffer], ignore_index=True)
+        else:
+            x_tensor = torch.cat([item[0] for item in buffer], dim=0)
+            y_tensor = torch.cat([item[1] for item in buffer], dim=0)
+            metadata_df = None
+
+        permutation = torch.randperm(x_tensor.shape[0])
+        for start in range(0, x_tensor.shape[0], self.batch_size):
+            batch_index = permutation[start:start + self.batch_size]
+            if self.return_metadata:
+                batch_metadata = metadata_df.iloc[batch_index.numpy()].reset_index(drop=True)
+                yield x_tensor[batch_index], y_tensor[batch_index], batch_metadata
+            else:
+                yield x_tensor[batch_index], y_tensor[batch_index]
+
+    def __iter__(self):
+        """
+        Yield one batch of PyTorch tensors at a time.
+        """
+        if not self.shuffle:
+            yield from self._iter_ordered_batches()
+            return
+
+        buffer = []
+        buffered_rows = 0
+        flush_threshold = self.batch_size * self.shuffle_buffer_batches
+        for item in self._iter_ordered_batches():
+            buffer.append(item)
+            buffered_rows += item[0].shape[0]
+            if buffered_rows >= flush_threshold:
+                yield from self._flush_shuffle_buffer(buffer)
+                buffer = []
+                buffered_rows = 0
+
+        if buffer:
+            yield from self._flush_shuffle_buffer(buffer)
 
     def __len__(self):
         """

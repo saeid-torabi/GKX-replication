@@ -22,7 +22,29 @@ The training pipeline follows the paper's recursive logic:
 - rolling validation window
 - one-year out-of-sample test window
 
-The portfolio backtest currently forms monthly long-short decile portfolios from out-of-sample stock predictions.
+The current main pipeline focuses on recursive stock-level prediction and stock-level out-of-sample evaluation.
+
+## What The Code Does So Far
+
+The current codebase already does the following:
+
+1. Takes a cleaned base parquet panel produced in the notebook.
+2. Streams that parquet in batches instead of loading the full interaction matrix into memory.
+3. Rebuilds the 920 GKX baseline predictors on the fly:
+   - 94 firm characteristics
+   - 752 characteristic-macro interactions
+   - 74 SIC2 dummies
+4. Runs recursive yearly experiments:
+   - expanding training window
+   - rolling 12-year validation window
+   - one-year out-of-sample test window
+5. Trains a neural network for each test year.
+6. Selects the best model state using validation loss.
+7. Produces out-of-sample stock predictions for the test window.
+8. Computes stock-level out-of-sample \(R^2\).
+9. Saves predictions, split summaries, evaluation tables, and plots.
+
+So, in practical terms, the code now runs a full recursive forecasting experiment and writes the outputs to an experiment folder.
 
 ## Repository Structure
 
@@ -36,7 +58,7 @@ The portfolio backtest currently forms monthly long-short decile portfolios from
   Defines the feed-forward neural network architectures.
 
 - [train.py](./train.py)
-  Handles model fitting, validation loss evaluation, and out-of-sample prediction.
+  Handles model fitting, validation loss evaluation, best-state selection, and out-of-sample prediction.
 
 - [splits.py](./splits.py)
   Generates recursive train/validation/test windows.
@@ -45,10 +67,10 @@ The portfolio backtest currently forms monthly long-short decile portfolios from
   Computes out-of-sample predictive metrics such as stock-level \(R^2_{oos}\).
 
 - [backtest.py](./backtest.py)
-  Builds decile portfolios from out-of-sample predictions and computes long-short performance.
+  Experimental decile-backtest utilities. These are currently not part of the main reporting pipeline because they are not aligned with the paper's Table 5 methodology.
 
 - [main.py](./main.py)
-  Main experiment entrypoint.
+  Main recursive experiment entrypoint. It orchestrates split generation, training, prediction, evaluation, backtesting, and plot saving.
 
 ## Data Workflow
 
@@ -66,6 +88,27 @@ That file should contain:
 - 8 macro columns prefixed with `macro_`
 
 The interaction matrix is **not** saved explicitly in the parquet file. It is generated batch-by-batch during training to avoid memory failures.
+
+## Current Python Workflow
+
+When [main.py](./main.py) runs, it does this:
+
+1. Parses the experiment arguments.
+2. Builds the recursive yearly train/validation/test splits from [splits.py](./splits.py).
+3. For each test year:
+   - creates a filtered [GKXDataGenerator](./data_generator.py) for train, validation, and test
+   - builds the requested neural network from [models.py](./models.py)
+   - trains the model with [train.py](./train.py)
+   - selects the best model state by validation loss
+   - predicts on the out-of-sample test year
+4. Concatenates all out-of-sample predictions across years.
+5. Computes stock-level out-of-sample \(R^2\) with [evaluate.py](./evaluate.py).
+6. Saves:
+   - predictions parquet
+   - split-level summary CSV
+   - monthly and annual \(R^2\) tables
+   - JSON summary
+   - combined learning-curves plot
 
 ## Current Preprocessing Logic
 
@@ -90,11 +133,12 @@ The current Python pipeline requires:
 - `pandas`
 - `pyarrow`
 - `torch`
+- `matplotlib`
 
 Install the missing runtime dependencies with:
 
 ```bash
-python -m pip install numpy pandas pyarrow torch
+python -m pip install numpy pandas pyarrow torch matplotlib
 ```
 
 ## Quick Smoke Test
@@ -112,14 +156,14 @@ This checks that:
 - interaction construction works
 - the model trains
 - predictions are generated
-- evaluation and backtest files are written
+- evaluation files are written
 
 ## Example Full Run
 
 Example experiment run:
 
 ```bash
-python main.py --model NN1 --epochs 5 --batch_size 8192 --output_dir outputs/nn1_full
+python main.py --model NN1 --epochs 20 --batch_size 8192 --output_dir outputs/nn1_full
 ```
 
 ## Outputs
@@ -130,15 +174,16 @@ Each experiment writes output files such as:
 - split-level validation and test summary
 - monthly out-of-sample \(R^2\)
 - annual out-of-sample \(R^2\)
-- decile portfolio returns
-- long-short 10 minus 1 returns
 - JSON summary
+- learning curves PNG
 
 ## Notes
 
-- The current backtest defaults to equal-weighted deciles unless a valid positive weight column is available and passed through the pipeline.
-- The paper's stock-level decile portfolios are reconstituted monthly.
+- The paper's Table 5 is a portfolio-level predictive-\(R^2\) exercise, not the same thing as the decile long-short backtest utility.
+- To avoid reporting a non-comparable Sharpe ratio, the main pipeline currently does not report decile-backtest results.
 - The current neural network code is an initial implementation and should still be checked carefully against the paper's exact hyperparameter and tuning choices before treating results as final.
+- The current training loop keeps the best epoch by validation loss, but it does **not** yet implement true early stopping with patience.
+- The current setup is closer to a strong research prototype than a final paper-faithful production pipeline.
 
 ## Reference
 

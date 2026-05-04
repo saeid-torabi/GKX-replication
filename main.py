@@ -2,6 +2,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+import math
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -14,19 +15,13 @@ from train import predict_model, train_model
 
 
 def _metadata_cols(weight_col):
-    base_cols = ["permno", "YYYYMM"]
+    cols = ["permno", "YYYYMM"]
     if weight_col:
-        base_cols.append(weight_col)
-    return base_cols
+        cols.append(weight_col)
+    return cols
 
 
 def _plot_wealth_growth(long_short, output_dir):
-    if plt is None:
-        raise ImportError(
-            "matplotlib is required to plot wealth growth. "
-            "Install it with `pip install matplotlib`."
-        )
-
     wealth_df = long_short.copy()
     wealth_df["date"] = pd.to_datetime(
         wealth_df["YYYYMM"].astype(str),
@@ -42,8 +37,49 @@ def _plot_wealth_growth(long_short, output_dir):
 
     output_path = output_dir / "wealth_growth.png"
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.show()
     plt.close()
+
+    return output_path
+
+
+def _plot_learning_curves(all_histories, model_name, output_dir):
+    if not all_histories:
+        return None
+
+    n_plots = len(all_histories)
+    n_cols = min(4, n_plots)
+    n_rows = math.ceil(n_plots / n_cols)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(5 * n_cols, 3.5 * n_rows),
+        squeeze=False,
+    )
+    axes = axes.flatten()
+
+    for ax, split_history in zip(axes, all_histories):
+        history_df = pd.DataFrame(split_history["history"])
+        ax.plot(history_df["epoch"], history_df["train_loss"], label="Train Loss", linewidth=2)
+
+        if history_df["val_loss"].notna().any():
+            ax.plot(history_df["epoch"], history_df["val_loss"], label="Val Loss", linewidth=2)
+
+        ax.set_title(f"Test Year {split_history['test_year']}")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    for ax in axes[n_plots:]:
+        ax.axis("off")
+
+    fig.suptitle(f"{model_name} Learning Curves", fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    output_path = output_dir / f"{model_name.lower()}_learning_curves.png"
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
     return output_path
 
@@ -111,18 +147,55 @@ def main():
         help="Optional cap on validation batches per epoch for smoke tests.",
     )
     parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=5,
+        help=(
+            "Stop training if validation loss fails to improve for this many "
+            "consecutive epochs."
+        ),
+    )
+    parser.add_argument(
+        "--early_stopping_min_delta",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum drop in validation loss required to reset the early "
+            "stopping patience counter."
+        ),
+    )
+    parser.add_argument(
+        "--log_diagnostics",
+        action="store_true",
+        help=(
+            "Log gradient norms plus validation prediction/target summary "
+            "statistics for diagnosing unstable NN training."
+        ),
+    )
+    parser.add_argument(
+        "--no_shuffle_train",
+        action="store_true",
+        help="Disable shuffle-buffer randomization for training batches.",
+    )
+    parser.add_argument(
+        "--shuffle_buffer_batches",
+        type=int,
+        default=8,
+        help="Number of streamed batches to hold before shuffling training rows.",
+    )
+    parser.add_argument(
         "--max_test_years",
         type=int,
         default=None,
         help="Optional cap on the number of recursive test years to run.",
     )
     parser.add_argument(
-        "--weight_col",
+        "--decile_weight_col",
         type=str,
-        default=None,
+        default="market_cap",
         help=(
-            "Optional positive weight column for value-weighted decile backtests. "
-            "Leave empty to run equal-weighted deciles."
+            "Column used for value-weighted stock-level decile portfolios. "
+            "Set to an empty string to disable weighting and run equal-weighted deciles."
         ),
     )
     parser.add_argument(
@@ -139,7 +212,11 @@ def main():
     print("=" * 72)
     print(
         f"Hyperparameters -> epochs={args.epochs}, batch_size={args.batch_size:,}, "
-        f"lr={args.learning_rate}"
+        f"lr={args.learning_rate}, "
+        f"early_stopping_patience={args.early_stopping_patience}, "
+        f"early_stopping_min_delta={args.early_stopping_min_delta}, "
+        f"shuffle_train={not args.no_shuffle_train}, "
+        f"shuffle_buffer_batches={args.shuffle_buffer_batches}"
     )
 
     start_time = time.time()
@@ -156,6 +233,7 @@ def main():
 
     all_predictions = []
     split_results = []
+    all_histories = []
 
     for split in splits:
         print("\n" + "-" * 72)
@@ -171,6 +249,8 @@ def main():
             batch_size=args.batch_size,
             date_start=split.train_start,
             date_end=split.train_end,
+            shuffle=not args.no_shuffle_train,
+            shuffle_buffer_batches=args.shuffle_buffer_batches,
         )
         val_generator = GKXDataGenerator(
             filepath=args.data_path,
@@ -184,7 +264,7 @@ def main():
             date_start=split.test_start,
             date_end=split.test_end,
             return_metadata=True,
-            metadata_cols=_metadata_cols(args.weight_col),
+            metadata_cols=_metadata_cols(args.decile_weight_col or None),
         )
 
         model = build_neural_net(
@@ -200,6 +280,9 @@ def main():
             learning_rate=args.learning_rate,
             max_train_batches=args.max_train_batches,
             max_val_batches=args.max_val_batches,
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_min_delta=args.early_stopping_min_delta,
+            log_diagnostics=args.log_diagnostics,
         )
 
         predictions = predict_model(
@@ -210,6 +293,12 @@ def main():
         all_predictions.append(predictions)
 
         split_eval = summarize_prediction_panel(predictions)
+        all_histories.append(
+            {
+                "test_year": split.test_year,
+                "history": train_result["history"],
+            }
+        )
         split_results.append(
             {
                 "test_year": split.test_year,
@@ -225,21 +314,16 @@ def main():
 
     predictions_df = pd.concat(all_predictions, ignore_index=True)
     summary = summarize_prediction_panel(predictions_df)
-
-    if args.weight_col:
-        portfolio_returns, long_short = build_long_short_deciles(
-            predictions_df=predictions_df,
-            weight_col=args.weight_col,
-        )
-    else:
-        portfolio_returns, long_short = build_long_short_deciles(
-            predictions_df=predictions_df,
-            weight_col=None,
-        )
+    decile_weight_col = args.decile_weight_col or None
+    portfolio_returns, long_short = build_long_short_deciles(
+        predictions_df=predictions_df,
+        weight_col=decile_weight_col,
+    )
 
     split_results_df = pd.DataFrame(split_results)
-    long_short_sharpe = annualized_sharpe_ratio(long_short["long_short_10_1"])
+    decile_sharpe = annualized_sharpe_ratio(long_short["long_short_10_1"])
     wealth_plot_path = _plot_wealth_growth(long_short, output_dir)
+    learning_curves_path = _plot_learning_curves(all_histories, args.model, output_dir)
 
     predictions_path = output_dir / f"{args.model.lower()}_predictions.parquet"
     split_results_path = output_dir / f"{args.model.lower()}_split_results.csv"
@@ -259,8 +343,8 @@ def main():
     summary_payload = {
         "model": args.model,
         "overall_oos_r2": float(summary["overall_oos_r2"]),
-        "long_short_sharpe": float(long_short_sharpe),
-        "weight_col": args.weight_col,
+        "decile_strategy_annualized_sharpe": float(decile_sharpe),
+        "decile_weight_col": decile_weight_col,
         "test_start_year": args.test_start_year,
         "test_end_year": splits[-1].test_year,
     }
@@ -270,9 +354,12 @@ def main():
     print("\n" + "=" * 72)
     print(f"Experiment complete in {elapsed_minutes:.2f} minutes")
     print(f"Overall OOS R^2: {summary['overall_oos_r2']:.6f}")
-    print(f"Long-short decile Sharpe: {long_short_sharpe:.6f}")
+    print(f"Decile strategy annualized Sharpe: {decile_sharpe:.6f}")
     print(f"Predictions saved to {predictions_path}")
+    print(f"Long-short decile returns saved to {long_short_path}")
     print(f"Wealth growth plot saved to {wealth_plot_path}")
+    if learning_curves_path is not None:
+        print(f"Learning curves saved to {learning_curves_path}")
     print("=" * 72)
 
 
