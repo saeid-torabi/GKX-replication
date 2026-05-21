@@ -250,6 +250,8 @@ class GKXDataGenerator:
         permutation = torch.randperm(x_tensor.shape[0])
         for start in range(0, x_tensor.shape[0], self.batch_size):
             batch_index = permutation[start:start + self.batch_size]
+            if batch_index.numel() < 2:
+                continue
             if self.return_metadata:
                 batch_metadata = metadata_df.iloc[batch_index.numpy()].reset_index(drop=True)
                 yield x_tensor[batch_index], y_tensor[batch_index], batch_metadata

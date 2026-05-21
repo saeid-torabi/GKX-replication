@@ -38,7 +38,8 @@ The current codebase already does the following:
    - expanding training window
    - rolling 12-year validation window
    - one-year out-of-sample test window
-5. Trains a neural network for each test year.
+5. Trains a neural network for each test year using an MSE objective plus
+   GKX-style L1 regularization on network weight tensors.
 6. Selects the best model state using validation loss.
 7. Produces out-of-sample stock predictions for the test window.
 8. Computes stock-level out-of-sample \(R^2\).
@@ -98,7 +99,8 @@ When [main.py](./main.py) runs, it does this:
 3. For each test year:
    - creates a filtered [GKXDataGenerator](./data_generator.py) for train, validation, and test
    - builds the requested neural network from [models.py](./models.py)
-   - trains the model with [train.py](./train.py)
+   - trains the model with [train.py](./train.py), including the configured
+     L1 penalty coefficient
    - selects the best model state by validation loss
    - predicts on the out-of-sample test year
 4. Concatenates all out-of-sample predictions across years.
@@ -107,8 +109,10 @@ When [main.py](./main.py) runs, it does this:
    - predictions parquet
    - split-level summary CSV
    - monthly and annual \(R^2\) tables
+   - decile portfolio performance table
    - JSON summary
-   - combined learning-curves plot
+   - combined learning-curves plot, with the penalized training objective when
+     L1 regularization is active
 
 ## Current Preprocessing Logic
 
@@ -146,7 +150,7 @@ python -m pip install numpy pandas pyarrow torch matplotlib
 Run a one-year, one-batch smoke test:
 
 ```bash
-python main.py --model NN1 --epochs 1 --batch_size 2048 --max_train_batches 1 --max_val_batches 1 --max_test_years 1 --output_dir /tmp/gkx_smoke
+python main.py --model NN1 --epochs 1 --batch_size 2048 --l1_lambda 1e-5 --max_train_batches 1 --max_val_batches 1 --max_test_years 1 --output_dir /tmp/gkx_smoke
 ```
 
 This checks that:
@@ -163,8 +167,13 @@ This checks that:
 Example experiment run:
 
 ```bash
-python main.py --model NN1 --epochs 20 --batch_size 8192 --output_dir outputs/nn1_full
+python main.py --model NN1 --epochs 20 --batch_size 8192 --l1_lambda 1e-5 --output_dir outputs/nn1_full
 ```
+
+The `--l1_lambda` option controls the L1 coefficient in the neural-network
+training objective. It defaults to `1e-5`, the lower end of the GKX tuning
+range. Set `--l1_lambda 0` to run an unregularized diagnostic, or rerun with
+larger values such as `1e-4` and `1e-3` when tuning by validation performance.
 
 ## Outputs
 
@@ -174,15 +183,23 @@ Each experiment writes output files such as:
 - split-level validation and test summary
 - monthly out-of-sample \(R^2\)
 - annual out-of-sample \(R^2\)
+- decile portfolio performance table with prediction, average return, return
+  standard deviation, and annualized Sharpe ratio for deciles 1-10 plus 10-1
 - JSON summary
 - learning curves PNG
 
 ## Notes
 
 - The paper's Table 5 is a portfolio-level predictive-\(R^2\) exercise, not the same thing as the decile long-short backtest utility.
-- To avoid reporting a non-comparable Sharpe ratio, the main pipeline currently does not report decile-backtest results.
-- The current neural network code is an initial implementation and should still be checked carefully against the paper's exact hyperparameter and tuning choices before treating results as final.
-- The current training loop keeps the best epoch by validation loss, but it does **not** yet implement true early stopping with patience.
+- The main pipeline reports decile long-short diagnostics, but they are not a
+  substitute for the paper's Table 5 portfolio-level predictive-\(R^2\) exercise.
+- The neural-network training loop now supports GKX-style L1 regularization.
+  Training logs report both plain training MSE and the penalized training
+  objective; validation selection remains based on unpenalized validation MSE.
+  Learning-curve plots show the full penalized training objective when it is
+  available.
+- The current neural network code is an initial implementation and should still be checked carefully against the paper's full hyperparameter and ensemble choices before treating results as final.
+- The current training loop keeps the best epoch by validation loss and supports early stopping with patience.
 - The current setup is closer to a strong research prototype than a final paper-faithful production pipeline.
 
 ## Reference

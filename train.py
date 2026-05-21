@@ -55,9 +55,32 @@ def _gradient_norm(model):
     return total_sq_norm ** 0.5
 
 
+def _l1_regularized_parameters(model):
+    """
+    Yield weight tensors covered by the GKX-style l1 penalty.
+
+    Biases and one-dimensional batch-normalization parameters are excluded so
+    the penalty targets network weights rather than affine offsets.
+    """
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad and parameter.ndim > 1:
+            yield name, parameter
+
+
+def _l1_penalty(model, device):
+    penalty = None
+    for _, parameter in _l1_regularized_parameters(model):
+        parameter_penalty = parameter.abs().sum()
+        penalty = parameter_penalty if penalty is None else penalty + parameter_penalty
+
+    if penalty is None:
+        return torch.zeros((), device=device)
+    return penalty
+
+
 def evaluate_loss(model, generator, device, max_batches=None, collect_diagnostics=False):
     model.eval()
-    # The paper's neural networks minimize a penalized l2 objective.
+    # Validation reports predictive MSE; regularization is applied only in training.
     loss_fn = torch.nn.MSELoss()
     running_loss = 0.0
     batches_seen = 0
@@ -108,14 +131,27 @@ def train_model(
     early_stopping_patience=5,
     early_stopping_min_delta=0.0,
     log_diagnostics=False,
+    l1_lambda=1e-5,
 ):
+    if l1_lambda < 0:
+        raise ValueError("l1_lambda must be non-negative.")
+
     device = get_device(device)
     print(f"Training on device: {device}")
     model = model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    # The paper's NN objective is l2, not Huber.
+    # The paper's NN objective is MSE plus an l1 penalty, not Huber.
     loss_fn = torch.nn.MSELoss()
+    l1_parameter_names = [name for name, _ in _l1_regularized_parameters(model)]
+    if l1_lambda > 0:
+        print(
+            "L1 regularization enabled: "
+            f"lambda={l1_lambda:.6g}, "
+            f"regularized_weight_tensors={len(l1_parameter_names)}"
+        )
+    else:
+        print("L1 regularization disabled: lambda=0")
 
     history = []
     best_metric = None
@@ -124,7 +160,9 @@ def train_model(
 
     for epoch in range(1, epochs + 1):
         model.train()
-        running_loss = 0.0
+        running_mse = 0.0
+        running_objective = 0.0
+        running_l1_penalty = 0.0
         batches_seen = 0
 
         for batch_idx, (x_batch, y_batch) in enumerate(train_generator, start=1):
@@ -133,30 +171,45 @@ def train_model(
 
             optimizer.zero_grad(set_to_none=True)
             predictions = model(x_batch)
-            loss = loss_fn(predictions, y_batch)
+            mse_loss = loss_fn(predictions, y_batch)
+            if l1_lambda > 0:
+                l1_penalty = _l1_penalty(model, device)
+            else:
+                l1_penalty = torch.zeros((), device=device)
+            loss = mse_loss + (l1_lambda * l1_penalty)
             loss.backward()
             grad_norm = _gradient_norm(model)
             optimizer.step()
 
-            running_loss += loss.item()
+            running_mse += mse_loss.item()
+            running_objective += loss.item()
+            running_l1_penalty += l1_penalty.item()
             batches_seen = batch_idx
 
             if batch_idx % log_every == 0 or batch_idx == len(train_generator):
-                avg_so_far = running_loss / batch_idx
                 log_parts = [
                     f"epoch={epoch:03d}/{epochs:03d}",
                     f"batch={batch_idx:05d}/{len(train_generator):05d}",
-                    f"avg_train_loss={avg_so_far:.6f}",
+                    f"avg_train_mse={running_mse / batch_idx:.6f}",
                 ]
+                if l1_lambda > 0:
+                    log_parts.extend(
+                        [
+                            f"avg_train_objective={running_objective / batch_idx:.6f}",
+                            f"avg_l1_penalty={running_l1_penalty / batch_idx:.6f}",
+                        ]
+                    )
                 if log_diagnostics:
                     log_parts.append(f"grad_l2={grad_norm:.6g}")
                 print(" | ".join(log_parts))
 
             if max_train_batches is not None and batch_idx >= max_train_batches:
-                print(f"⚡️ Stopped early after {batch_idx} training batches for this epoch.")
+                print(f"Stopped early after {batch_idx} training batches for this epoch.")
                 break
 
-        train_loss = running_loss / batches_seen
+        train_loss = running_mse / batches_seen
+        train_objective = running_objective / batches_seen
+        train_l1_penalty = running_l1_penalty / batches_seen
 
         if val_generator is not None:
             val_result = evaluate_loss(
@@ -175,9 +228,16 @@ def train_model(
             selection_metric = val_loss
             log_parts = [
                 f"epoch={epoch:03d} complete",
-                f"train_loss={train_loss:.6f}",
-                f"val_loss={val_loss:.6f}",
+                f"train_mse={train_loss:.6f}",
             ]
+            if l1_lambda > 0:
+                log_parts.extend(
+                    [
+                        f"train_objective={train_objective:.6f}",
+                        f"l1_penalty={train_l1_penalty:.6f}",
+                    ]
+                )
+            log_parts.append(f"val_loss={val_loss:.6f}")
             if log_diagnostics:
                 log_parts.extend(
                     [
@@ -189,12 +249,25 @@ def train_model(
         else:
             val_loss = None
             selection_metric = train_loss
-            print(f"Epoch {epoch:03d} complete | mean training loss {train_loss:.6f}")
+            log_parts = [
+                f"epoch={epoch:03d} complete",
+                f"train_mse={train_loss:.6f}",
+            ]
+            if l1_lambda > 0:
+                log_parts.extend(
+                    [
+                        f"train_objective={train_objective:.6f}",
+                        f"l1_penalty={train_l1_penalty:.6f}",
+                    ]
+                )
+            print(" | ".join(log_parts))
 
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": train_loss,
+                "train_objective": train_objective,
+                "l1_penalty": train_l1_penalty,
                 "val_loss": val_loss,
             }
         )
