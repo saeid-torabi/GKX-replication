@@ -40,10 +40,12 @@ The current codebase already does the following:
    - one-year out-of-sample test window
 5. Trains a neural network for each test year using an MSE objective plus
    GKX-style L1 regularization on network weight tensors.
-6. Selects the best model state using validation loss.
-7. Produces out-of-sample stock predictions for the test window.
-8. Computes stock-level out-of-sample \(R^2\).
-9. Saves predictions, split summaries, evaluation tables, and plots.
+6. Optionally trains a GKX-style ensemble of independently initialized neural
+   networks and averages their out-of-sample forecasts.
+7. Selects the best model state for each ensemble member using validation loss.
+8. Produces out-of-sample stock predictions for the test window.
+9. Computes stock-level out-of-sample \(R^2\).
+10. Saves predictions, split summaries, evaluation tables, and plots.
 
 So, in practical terms, the code now runs a full recursive forecasting experiment and writes the outputs to an experiment folder.
 
@@ -99,11 +101,12 @@ When [main.py](./main.py) runs, it does this:
 3. For each test year:
    - creates a filtered [GKXDataGenerator](./data_generator.py) for train, validation, and test
    - builds the requested neural network from [models.py](./models.py)
-   - trains the model with [train.py](./train.py), including the configured
-     L1 penalty coefficient
-   - selects the best model state by validation loss
-   - predicts on the out-of-sample test year
-4. Concatenates all out-of-sample predictions across years.
+   - trains the configured number of ensemble members with [train.py](./train.py),
+     including the configured L1 penalty coefficient
+   - selects the best model state for each member by validation loss
+   - predicts on the out-of-sample test year with each member
+   - averages ensemble member predictions before evaluation
+4. Concatenates all averaged out-of-sample predictions across years.
 5. Computes stock-level out-of-sample \(R^2\) with [evaluate.py](./evaluate.py).
 6. Saves:
    - predictions parquet
@@ -167,13 +170,102 @@ This checks that:
 Example experiment run:
 
 ```bash
-python main.py --model NN1 --epochs 20 --batch_size 8192 --l1_lambda 1e-5 --output_dir outputs/nn1_full
+python main.py --model NN1 --epochs 20 --batch_size 8192 --l1_lambda 1e-5 --ensemble_size 5 --seed 42 --output_dir outputs/nn1_ensemble_full
 ```
 
 The `--l1_lambda` option controls the L1 coefficient in the neural-network
 training objective. It defaults to `1e-5`, the lower end of the GKX tuning
 range. Set `--l1_lambda 0` to run an unregularized diagnostic, or rerun with
 larger values such as `1e-4` and `1e-3` when tuning by validation performance.
+
+The `--ensemble_size` option controls how many independently initialized neural
+networks are trained for each recursive split. Member `k` uses seed
+`--seed + k`, with `k` starting at zero. The final stock-level forecast is the
+simple average of member forecasts, following the GKX neural-network ensemble
+approach for reducing prediction variance from stochastic optimization.
+
+## Validation Grid Search
+
+The main entrypoint can tune neural-network hyperparameters on each split's
+rolling validation window before scoring that split's test year:
+
+```bash
+python main.py \
+  --model NN1 \
+  --epochs 100 \
+  --batch_size 10000 \
+  --tune_hyperparameters \
+  --tune_learning_rates 0.001,0.01 \
+  --tune_l1_lambdas 1e-5,3e-5,1e-4,3e-4,1e-3 \
+  --ensemble_size 5 \
+  --seed 42 \
+  --test_start_year 1987 \
+  --test_end_year 2016 \
+  --early_stopping_patience 5 \
+  --decile_weight_col market_cap \
+  --output_dir outputs/nn1_tuned_ensemble5_full
+```
+
+For each recursive split, every learning-rate/L1 combination is trained on the
+expanding training window and evaluated on that split's 12-year validation
+window. The combination with the lowest MSE from the averaged ensemble
+validation forecast is selected, and only that selected ensemble is used for
+the test-year prediction. Individual member validation losses are still saved
+as diagnostics. The selected hyperparameters are saved in the split results
+CSV, and the full validation grid is saved to `<model>_tuning_results.csv`.
+
+## Checkpointing and Resuming
+
+Long tuned-ensemble runs (many networks per test year) are now crash-safe. A run
+writes checkpoints as it goes and **auto-resumes** if it is restarted, so an app
+close, a laptop restart, or a failure at hour 200 no longer throws away the work.
+
+How it works:
+
+- A `checkpoints/` folder is created inside `--output_dir` (override with
+  `--checkpoint_dir`).
+- Training is checkpointed at **ensemble-member granularity**. After each member
+  of each hyperparameter combination is trained, its weights and history are
+  saved. After a combination finishes, a `combo.json` marker records its
+  validation loss. After a full test year finishes, that year's predictions and
+  metric rows are persisted and `progress.json` is updated.
+- On restart with the **same command**, the run reads `progress.json`, skips
+  every completed test year, reloads any already-trained members/combos for the
+  in-progress year, and trains only what is missing.
+- **Output files are rewritten after every completed test year**, so
+  `nn1_predictions.parquet`, the R^2 tables, portfolio performance, summary JSON,
+  and plots always reflect all years finished so far — even if the run is
+  interrupted before reaching the final year.
+
+Config guard: the run's key settings (model, data, epochs, learning rate, L1,
+tuning grid, ensemble size, seed, window, etc.) are stored in
+`checkpoints/run_config.json`. If you restart with **different** settings, the
+run refuses to resume and tells you what changed, so completed and new years are
+never silently mixed. Use `--force_restart` to discard existing checkpoints and
+begin again from the first test year.
+
+Because checkpoints are keyed to `--output_dir`, just re-run the exact same
+command after any interruption:
+
+```bash
+python main.py --model NN1 --epochs 100 --batch_size 10000 \
+  --tune_hyperparameters --tune_learning_rates 0.001,0.01 \
+  --tune_l1_lambdas 1e-5,3e-5,1e-4,3e-4,1e-3 \
+  --ensemble_size 5 --seed 42 \
+  --test_start_year 1987 --test_end_year 2016 \
+  --output_dir outputs/nn1_tuned_ensemble5_full
+# ... if it dies, run the identical command again to continue.
+```
+
+### Testing the checkpoint logic
+
+- `python test_checkpoint_logic.py` — fast checks of the resume state machine
+  (config guard, progress tracking, idempotent output rewrites, and
+  combo/member skip-on-resume). Runs without torch or the real dataset.
+- `python smoke_test_checkpoints.py` — end-to-end test on tiny synthetic data:
+  it does a clean run, injects a crash mid-year, resumes, and verifies the
+  resume trains only the missing networks and reproduces the clean run's
+  predictions exactly. Requires torch + pyarrow (i.e. run it on your machine).
 
 ## Outputs
 
@@ -183,6 +275,8 @@ Each experiment writes output files such as:
 - split-level validation and test summary
 - monthly out-of-sample \(R^2\)
 - annual out-of-sample \(R^2\)
+- selected-split learning history with train MSE, train objective, validation
+  MSE, best epoch, and patience counter
 - decile portfolio performance table with prediction, average return, return
   standard deviation, and annualized Sharpe ratio for deciles 1-10 plus 10-1
 - JSON summary
@@ -198,8 +292,19 @@ Each experiment writes output files such as:
   objective; validation selection remains based on unpenalized validation MSE.
   Learning-curve plots show the full penalized training objective when it is
   available.
+- Neural-network runs support GKX-style seed ensembles through
+  `--ensemble_size`. The saved predictions are the averaged ensemble forecasts,
+  and split-level validation loss reports the mean, minimum, and maximum best
+  validation loss across ensemble members.
+- Split-level validation grid search can be enabled with
+  `--tune_hyperparameters`; the supported grid currently covers Adam learning
+  rate and L1 penalty, which are the neural-network tuning parameters listed in
+  the paper's Internet Appendix table. When ensembles are used, grid selection
+  is based on the validation MSE of the averaged ensemble forecast.
 - The current neural network code is an initial implementation and should still be checked carefully against the paper's full hyperparameter and ensemble choices before treating results as final.
 - The current training loop keeps the best epoch by validation loss and supports early stopping with patience.
+- Runs save `<model>_learning_history.csv` so early stopping can be audited
+  numerically instead of only from the learning-curve plot.
 - The current setup is closer to a strong research prototype than a final paper-faithful production pipeline.
 
 ## Reference
@@ -213,3 +318,22 @@ Paper:
 Internet appendix:
 
 - https://academic.oup.com/rfs/article/33/5/2223/5758276#supplementary-data
+
+
+
+
+## Full Test Command
+
+```bash
+
+python main.py --model NN1 --epochs 100 --batch_size 10000 \
+  --tune_hyperparameters --tune_learning_rates 0.001,0.01 \
+  --tune_l1_lambdas 1e-5,3e-5,1e-4,3e-4,1e-3 \
+  --ensemble_size 10 --seed 42 \
+  --test_start_year 1987 --test_end_year 2016 \
+  --early_stopping_patience 5 \
+  --decile_weight_col market_cap \
+  --output_dir outputs/nn1_tuned_ensemble10_full
+
+# ... if it dies, run the identical command again to continue.
+```

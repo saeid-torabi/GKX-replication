@@ -1,4 +1,5 @@
 import copy
+import numpy as np
 import pandas as pd
 
 try:
@@ -156,7 +157,9 @@ def train_model(
     history = []
     best_metric = None
     best_state_dict = None
+    best_epoch = None
     patience_counter = 0
+    early_stopped = False
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -262,16 +265,6 @@ def train_model(
                 )
             print(" | ".join(log_parts))
 
-        history.append(
-            {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "train_objective": train_objective,
-                "l1_penalty": train_l1_penalty,
-                "val_loss": val_loss,
-            }
-        )
-
         improved = (
             best_metric is None
             or selection_metric < (best_metric - early_stopping_min_delta)
@@ -280,15 +273,32 @@ def train_model(
         if improved:
             best_metric = selection_metric
             best_state_dict = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
             patience_counter = 0
         else:
             patience_counter += 1
+
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_objective": train_objective,
+                "l1_penalty": train_l1_penalty,
+                "val_loss": val_loss,
+                "selection_metric": selection_metric,
+                "best_metric": best_metric,
+                "best_epoch": best_epoch,
+                "improved": improved,
+                "patience_counter": patience_counter,
+            }
+        )
 
         if (
             val_generator is not None
             and early_stopping_patience is not None
             and patience_counter >= early_stopping_patience
         ):
+            early_stopped = True
             print(
                 "Early stopping triggered: "
                 f"validation loss failed to improve by more than "
@@ -304,6 +314,9 @@ def train_model(
         "model": model,
         "history": history,
         "best_metric": best_metric,
+        "best_epoch": best_epoch,
+        "epochs_trained": len(history),
+        "early_stopped": early_stopped,
     }
 
 
@@ -326,3 +339,28 @@ def predict_model(model, generator, device=None, prediction_col="prediction"):
             outputs.append(batch_output)
 
     return pd.concat(outputs, ignore_index=True)
+
+
+def predict_values(model, generator, device=None, max_batches=None):
+    device = get_device(device)
+    model = model.to(device)
+    model.eval()
+
+    prediction_chunks = []
+    target_chunks = []
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(generator, start=1):
+            x_batch, y_batch = batch[:2]
+            predictions = model(x_batch.to(device)).cpu().numpy().reshape(-1)
+            targets = y_batch.cpu().numpy().reshape(-1)
+            prediction_chunks.append(predictions)
+            target_chunks.append(targets)
+
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+    return (
+        np.concatenate(prediction_chunks),
+        np.concatenate(target_chunks),
+    )
