@@ -19,3 +19,8 @@ __pycache__/
 
 # Notebook exports and scratch files
 *.html
+
+# Auxiliary dev / diagnostic scripts (not part of the core pipeline)
+test_checkpoint_logic.py
+smoke_test_checkpoints.py
+profile_pipeline.py

@@ -133,26 +133,29 @@ def train_model(
     early_stopping_min_delta=0.0,
     log_diagnostics=False,
     l1_lambda=1e-5,
+    verbose=False,
+    heartbeat=False,
 ):
     if l1_lambda < 0:
         raise ValueError("l1_lambda must be non-negative.")
 
     device = get_device(device)
-    print(f"Training on device: {device}")
     model = model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     # The paper's NN objective is MSE plus an l1 penalty, not Huber.
     loss_fn = torch.nn.MSELoss()
     l1_parameter_names = [name for name, _ in _l1_regularized_parameters(model)]
-    if l1_lambda > 0:
-        print(
-            "L1 regularization enabled: "
-            f"lambda={l1_lambda:.6g}, "
-            f"regularized_weight_tensors={len(l1_parameter_names)}"
-        )
-    else:
-        print("L1 regularization disabled: lambda=0")
+    if verbose:
+        print(f"Training on device: {device}")
+        if l1_lambda > 0:
+            print(
+                "L1 regularization enabled: "
+                f"lambda={l1_lambda:.6g}, "
+                f"regularized_weight_tensors={len(l1_parameter_names)}"
+            )
+        else:
+            print("L1 regularization disabled: lambda=0")
 
     history = []
     best_metric = None
@@ -189,7 +192,9 @@ def train_model(
             running_l1_penalty += l1_penalty.item()
             batches_seen = batch_idx
 
-            if batch_idx % log_every == 0 or batch_idx == len(train_generator):
+            if verbose and (
+                batch_idx % log_every == 0 or batch_idx == len(train_generator)
+            ):
                 log_parts = [
                     f"epoch={epoch:03d}/{epochs:03d}",
                     f"batch={batch_idx:05d}/{len(train_generator):05d}",
@@ -207,7 +212,11 @@ def train_model(
                 print(" | ".join(log_parts))
 
             if max_train_batches is not None and batch_idx >= max_train_batches:
-                print(f"Stopped early after {batch_idx} training batches for this epoch.")
+                if verbose:
+                    print(
+                        f"Stopped early after {batch_idx} training batches "
+                        "for this epoch."
+                    )
                 break
 
         train_loss = running_mse / batches_seen
@@ -248,7 +257,8 @@ def train_model(
                         _format_stats("val_target", target_stats),
                     ]
                 )
-            print(" | ".join(log_parts))
+            if verbose:
+                print(" | ".join(log_parts))
         else:
             val_loss = None
             selection_metric = train_loss
@@ -263,7 +273,14 @@ def train_model(
                         f"l1_penalty={train_l1_penalty:.6f}",
                     ]
                 )
-            print(" | ".join(log_parts))
+            if verbose:
+                print(" | ".join(log_parts))
+
+        # Heartbeat: one flushed mark per completed epoch so a long, otherwise
+        # silent run visibly shows it is alive. Suppressed under verbose (which
+        # already prints a full line per epoch).
+        if heartbeat and not verbose:
+            print(".", end="", flush=True)
 
         improved = (
             best_metric is None
@@ -299,12 +316,13 @@ def train_model(
             and patience_counter >= early_stopping_patience
         ):
             early_stopped = True
-            print(
-                "Early stopping triggered: "
-                f"validation loss failed to improve by more than "
-                f"{early_stopping_min_delta:.6f} for "
-                f"{early_stopping_patience} consecutive epochs."
-            )
+            if verbose:
+                print(
+                    "Early stopping triggered: "
+                    f"validation loss failed to improve by more than "
+                    f"{early_stopping_min_delta:.6f} for "
+                    f"{early_stopping_patience} consecutive epochs."
+                )
             break
 
     if best_state_dict is not None:

@@ -330,6 +330,8 @@ def _config_identity(args, tune_learning_rates, tune_l1_lambdas):
         "tune_hyperparameters": bool(args.tune_hyperparameters),
         "tune_learning_rates": [float(x) for x in tune_learning_rates],
         "tune_l1_lambdas": [float(x) for x in tune_l1_lambdas],
+        "full_ensemble_grid": bool(args.full_ensemble_grid),
+        "batchnorm_before_relu": bool(args.batchnorm_before_relu),
         "ensemble_size": args.ensemble_size,
         "seed": args.seed,
         "test_start_year": args.test_start_year,
@@ -400,6 +402,7 @@ def _save_member_checkpoint(
     l1_lambda,
     input_features,
     architecture,
+    batchnorm_after_relu=True,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -415,6 +418,7 @@ def _save_member_checkpoint(
         "l1_lambda": l1_lambda,
         "input_features": int(input_features),
         "architecture": architecture,
+        "batchnorm_after_relu": bool(batchnorm_after_relu),
     }
     # Atomic write: a crash mid-write leaves the previous good file (or none),
     # never a truncated checkpoint that would fail to load on resume.
@@ -428,6 +432,7 @@ def _load_member_checkpoint(path):
     model = build_neural_net(
         architecture=payload["architecture"],
         input_features=payload["input_features"],
+        batchnorm_after_relu=payload.get("batchnorm_after_relu", True),
     )
     model.load_state_dict(payload["state_dict"])
     train_result = {
@@ -454,37 +459,48 @@ def _train_ensemble_resumable(
     input_features,
     learning_rate,
     l1_lambda,
+    n_members,
+    device=None,
+    quiet=False,
 ):
-    """Train an ensemble, checkpointing after each member so a crash resumes
-    at the next untrained member instead of restarting the whole ensemble."""
+    """Train ``n_members`` networks, checkpointing after each so a crash resumes
+    at the next untrained member instead of restarting the whole ensemble.
+
+    ``n_members`` is decoupled from ``args.ensemble_size`` so grid-search tuning
+    can train a single network per candidate while the final selected model is
+    trained as the full ensemble."""
     member_results = []
     member_histories = []
+    heartbeat = (not args.no_progress) and (not args.verbose)
 
-    for member_idx in range(args.ensemble_size):
+    for member_idx in range(n_members):
         member_number = member_idx + 1
         member_seed = args.seed + member_idx
         member_path = _member_checkpoint_path(combo_dir, member_idx)
 
         if member_path.exists():
             train_result, member_history = _load_member_checkpoint(member_path)
-            best_metric = train_result["best_metric"]
-            best_metric_str = (
-                f"{best_metric:.6f}" if best_metric is not None else "n/a"
-            )
-            print(
-                f"Resume: loaded ensemble member {member_number}/"
-                f"{args.ensemble_size} from checkpoint | "
-                f"best val loss {best_metric_str}"
-            )
+            if not quiet:
+                best_metric = train_result["best_metric"]
+                best_metric_str = (
+                    f"{best_metric:.5f}" if best_metric is not None else "n/a"
+                )
+                print(
+                    f"      net {member_number}/{n_members}  "
+                    f"loaded from checkpoint  (val {best_metric_str})"
+                )
         else:
-            print(
-                f"Ensemble member {member_number}/{args.ensemble_size} | "
-                f"seed={member_seed} | lr={learning_rate} | l1_lambda={l1_lambda}"
-            )
+            # When showing a per-net line with heartbeat dots, print the prefix
+            # now (no newline) so the dots stream right after it.
+            if not quiet and heartbeat:
+                print(
+                    f"      net {member_number}/{n_members}  ", end="", flush=True
+                )
             _set_global_seed(member_seed)
             model = build_neural_net(
                 architecture=args.model,
                 input_features=input_features,
+                batchnorm_after_relu=not args.batchnorm_before_relu,
             )
             train_result = train_model(
                 model=model,
@@ -498,6 +514,9 @@ def _train_ensemble_resumable(
                 early_stopping_min_delta=args.early_stopping_min_delta,
                 log_diagnostics=args.log_diagnostics,
                 l1_lambda=l1_lambda,
+                device=device,
+                verbose=args.verbose,
+                heartbeat=heartbeat,
             )
             _save_member_checkpoint(
                 path=member_path,
@@ -508,16 +527,23 @@ def _train_ensemble_resumable(
                 l1_lambda=l1_lambda,
                 input_features=input_features,
                 architecture=args.model,
+                batchnorm_after_relu=not args.batchnorm_before_relu,
             )
             member_history = {
                 "ensemble_member": member_number,
                 "seed": member_seed,
                 "history": train_result["history"],
             }
-            print(
-                f"Ensemble member {member_number}/{args.ensemble_size} complete | "
-                f"best val loss {train_result['best_metric']:.6f}"
-            )
+            if not quiet:
+                summary = (
+                    f"val {train_result['best_metric']:.5f}  "
+                    f"(best epoch {train_result['best_epoch']}, "
+                    f"{train_result['epochs_trained']} ep)"
+                )
+                if heartbeat:
+                    print(f"  {summary}")
+                else:
+                    print(f"      net {member_number}/{n_members}  {summary}")
 
         member_results.append(train_result)
         member_histories.append(member_history)
@@ -546,8 +572,15 @@ def _run_year_resumable(
     tune_l1_lambdas,
     train_generator,
     val_generator,
+    device=None,
 ):
     """Run one test year's training with combo/member-level checkpointing.
+
+    By default (tune-then-ensemble), the validation grid search trains a single
+    network per hyperparameter candidate, and the full ``--ensemble_size``
+    ensemble is trained only at the selected candidate. Pass
+    ``--full_ensemble_grid`` to instead train the full ensemble at every grid
+    point (the older, ~ensemble_size x more expensive behavior).
 
     Returns the selected ensemble's member results and histories, the selected
     combo, and this year's tuning rows (empty when not tuning)."""
@@ -556,33 +589,41 @@ def _run_year_resumable(
     else:
         grid = [(args.learning_rate, args.l1_lambda)]
 
+    # Networks trained per grid candidate. Only the winner gets the full
+    # ensemble, unless the full-grid ensemble behavior is explicitly requested.
+    if args.tune_hyperparameters and not args.full_ensemble_grid:
+        grid_members = 1
+    else:
+        grid_members = args.ensemble_size
+
+    heartbeat = (not args.no_progress) and (not args.verbose)
     tuning_rows = []
     best_combo = None
+
+    if args.tune_hyperparameters:
+        net_word = "net" if grid_members == 1 else "nets"
+        print(f"  tuning: {len(grid)} candidates ({grid_members} {net_word} each)")
 
     for combo_idx, (candidate_lr, candidate_l1) in enumerate(grid):
         combo_dir = _combo_dir(checkpoint_dir, split.test_year, combo_idx)
         done_path = _combo_done_path(combo_dir)
+        tag = f"    [{combo_idx + 1}/{len(grid)}] lr={candidate_lr:g}  l1={candidate_l1:g}"
 
         if done_path.exists():
             info = json.loads(done_path.read_text())
             candidate_ensemble_loss = info.get("ensemble_val_loss")
             if args.tune_hyperparameters and info.get("tuning_row") is not None:
                 tuning_rows.append(info["tuning_row"])
-            print(
-                f"Resume: combo {combo_idx + 1}/{len(grid)} already complete "
-                f"(lr={candidate_lr}, l1_lambda={candidate_l1})"
-                + (
-                    f" | ensemble_val_loss={candidate_ensemble_loss:.6f}"
-                    if candidate_ensemble_loss is not None
-                    else ""
-                )
-            )
-        else:
             if args.tune_hyperparameters:
-                print(
-                    f"Grid candidate {combo_idx + 1}/{len(grid)} | "
-                    f"lr={candidate_lr} | l1_lambda={candidate_l1}"
+                loss_str = (
+                    f"val={candidate_ensemble_loss:.5f}"
+                    if candidate_ensemble_loss is not None
+                    else "done"
                 )
+                print(f"{tag}   {loss_str}  (cached)")
+        else:
+            if args.tune_hyperparameters and heartbeat:
+                print(f"{tag}   ", end="", flush=True)
             member_results, _member_histories = _train_ensemble_resumable(
                 args=args,
                 combo_dir=combo_dir,
@@ -591,6 +632,9 @@ def _run_year_resumable(
                 input_features=input_features,
                 learning_rate=candidate_lr,
                 l1_lambda=candidate_l1,
+                n_members=grid_members,
+                device=device,
+                quiet=args.tune_hyperparameters,
             )
 
             tuning_row = None
@@ -600,12 +644,13 @@ def _run_year_resumable(
                     member_results=member_results,
                     val_generator=val_generator,
                     max_val_batches=args.max_val_batches,
+                    device=device,
                 )
                 tuning_row = {
                     "test_year": split.test_year,
                     "learning_rate": candidate_lr,
                     "l1_lambda": candidate_l1,
-                    "ensemble_size": args.ensemble_size,
+                    "tuning_nets": grid_members,
                     "ensemble_val_loss": candidate_ensemble_loss,
                     "mean_best_val_loss": float(np.mean(candidate_losses)),
                     "min_best_val_loss": float(np.min(candidate_losses)),
@@ -622,11 +667,10 @@ def _run_year_resumable(
                     ),
                 }
                 tuning_rows.append(tuning_row)
-                print(
-                    "Grid candidate complete | "
-                    f"ensemble_val_loss={candidate_ensemble_loss:.6f} | "
-                    f"mean_member_best_val_loss={tuning_row['mean_best_val_loss']:.6f}"
-                )
+                if heartbeat:
+                    print(f"  val={candidate_ensemble_loss:.5f}")
+                else:
+                    print(f"{tag}   val={candidate_ensemble_loss:.5f}")
             else:
                 candidate_ensemble_loss = None
 
@@ -663,13 +707,32 @@ def _run_year_resumable(
 
     if args.tune_hyperparameters:
         print(
-            f"Selected hyperparameters for test year {split.test_year}: "
-            f"lr={best_combo['learning_rate']}, "
-            f"l1_lambda={best_combo['l1_lambda']}, "
-            f"ensemble_val_loss={best_combo['loss']:.6f}"
+            f"  selected: lr={best_combo['learning_rate']:g}  "
+            f"l1={best_combo['l1_lambda']:g}   (val={best_combo['loss']:.5f})"
         )
 
     best_combo_dir = _combo_dir(checkpoint_dir, split.test_year, best_combo["combo_idx"])
+
+    # Train the full ensemble at the selected configuration. When the grid only
+    # trained a single net per candidate (the default), this "tops up" the
+    # winning combo from 1 to ensemble_size members. Member 0 already exists and
+    # is reused, so only the extra members are trained; member seeds are
+    # identical, so the outcome matches training the full ensemble there.
+    if args.ensemble_size > grid_members:
+        print(f"  ensemble: training {args.ensemble_size} nets at selected config")
+        _train_ensemble_resumable(
+            args=args,
+            combo_dir=best_combo_dir,
+            train_generator=train_generator,
+            val_generator=val_generator,
+            input_features=input_features,
+            learning_rate=best_combo["learning_rate"],
+            l1_lambda=best_combo["l1_lambda"],
+            n_members=args.ensemble_size,
+            device=device,
+            quiet=False,
+        )
+
     member_results, member_histories = _load_combo_members(args, best_combo_dir)
     return member_results, member_histories, best_combo, tuning_rows
 
@@ -913,18 +976,21 @@ def _train_ensemble(
     return member_results, member_histories
 
 
-def _predict_ensemble(member_results, test_generator):
+def _predict_ensemble(member_results, test_generator, device=None):
     member_predictions = []
     for train_result in member_results:
         predictions = predict_model(
             model=train_result["model"],
             generator=test_generator,
+            device=device,
         )
         member_predictions.append(predictions)
     return _average_ensemble_predictions(member_predictions)
 
 
-def _ensemble_validation_loss(member_results, val_generator, max_val_batches=None):
+def _ensemble_validation_loss(
+    member_results, val_generator, max_val_batches=None, device=None
+):
     prediction_arrays = []
     targets = None
 
@@ -933,6 +999,7 @@ def _ensemble_validation_loss(member_results, val_generator, max_val_batches=Non
             model=train_result["model"],
             generator=val_generator,
             max_batches=max_val_batches,
+            device=device,
         )
         if targets is None:
             targets = member_targets
@@ -1250,6 +1317,54 @@ def main():
             "training begins again from the first test year."
         ),
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "mps", "cuda"],
+        help=(
+            "Compute device. 'auto' picks mps>cuda>cpu. On Apple silicon, NN1 is "
+            "small enough that 'cpu' is often faster than 'mps' (which is memory "
+            "bound on 8 GB machines); prefer '--device cpu' there and 'cuda' on a "
+            "GPU box."
+        ),
+    )
+    parser.add_argument(
+        "--full_ensemble_grid",
+        action="store_true",
+        help=(
+            "Train the full --ensemble_size ensemble at EVERY hyperparameter grid "
+            "point (older, ~ensemble_size x more expensive). Default is "
+            "tune-then-ensemble: tune with single networks, then train the full "
+            "ensemble only at the selected configuration."
+        ),
+    )
+    parser.add_argument(
+        "--batchnorm_before_relu",
+        action="store_true",
+        help=(
+            "Place batch normalization BEFORE the ReLU (Linear->BN->ReLU). The "
+            "default follows GKX Internet Appendix B.3, which applies batch "
+            "normalization AFTER the ReLU (Linear->ReLU->BN)."
+        ),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Print detailed per-epoch / per-batch training logs. Off by default; "
+            "the progress output shows one compact line per tuning candidate and "
+            "a summary per test year."
+        ),
+    )
+    parser.add_argument(
+        "--no_progress",
+        action="store_true",
+        help=(
+            "Disable the per-epoch heartbeat dots. By default each network prints "
+            "one '.' per completed epoch so a long run visibly shows it is alive."
+        ),
+    )
 
     args = parser.parse_args()
     if args.l1_lambda < 0:
@@ -1266,27 +1381,33 @@ def main():
     if any(value < 0 for value in tune_l1_lambdas):
         raise ValueError("--tune_l1_lambdas values must be non-negative.")
 
-    print("=" * 72)
-    print(f"Starting GKX recursive experiment: {args.model}")
+    resolved_device = None if args.device == "auto" else args.device
+    bn_order = "BN-before-ReLU" if args.batchnorm_before_relu else "BN-after-ReLU"
+    if args.tune_hyperparameters:
+        tune_mode = (
+            "full-grid ensemble" if args.full_ensemble_grid else "tune-then-ensemble"
+        )
+    else:
+        tune_mode = "fixed hyperparameters"
+
     print("=" * 72)
     print(
-        f"Hyperparameters -> epochs={args.epochs}, batch_size={args.batch_size:,}, "
-        f"lr={args.learning_rate}, "
-        f"l1_lambda={args.l1_lambda}, "
-        f"early_stopping_patience={args.early_stopping_patience}, "
-        f"early_stopping_min_delta={args.early_stopping_min_delta}, "
-        f"shuffle_train={not args.no_shuffle_train}, "
-        f"shuffle_buffer_batches={args.shuffle_buffer_batches}, "
-        f"ensemble_size={args.ensemble_size}, "
-        f"base_seed={args.seed}"
+        f"GKX {args.model} — recursive experiment "
+        f"{args.test_start_year}-{args.test_end_year}"
+    )
+    print("=" * 72)
+    print(
+        f"  device={args.device}  ·  epochs={args.epochs}  ·  "
+        f"batch={args.batch_size:,}  ·  ensemble={args.ensemble_size}  ·  "
+        f"seed={args.seed}"
+    )
+    print(
+        f"  early-stop patience={args.early_stopping_patience} "
+        f"(min_delta={args.early_stopping_min_delta:g})  ·  {bn_order}  ·  "
+        f"{tune_mode}"
     )
     if args.tune_hyperparameters:
-        print(
-            "Validation grid search enabled -> "
-            f"learning_rates={tune_learning_rates}, "
-            f"l1_lambdas={tune_l1_lambdas}, "
-            "selection=ensemble_averaged_validation_mse"
-        )
+        print(f"  grid: lr {tune_learning_rates}  x  l1 {tune_l1_lambdas}")
 
     start_time = time.time()
     output_dir = Path(args.output_dir)
@@ -1332,17 +1453,20 @@ def main():
         )
     input_features = (saved_config or {}).get("input_features")
 
-    for split in splits:
+    for split_idx, split in enumerate(splits, start=1):
         if split.test_year in completed_years:
-            print(f"Skipping already-completed test year {split.test_year}")
+            print(
+                f"[{split_idx}/{total_years}] test year {split.test_year} "
+                "already complete, skipping"
+            )
             continue
 
         print("\n" + "-" * 72)
-        print(f"Test year {split.test_year}")
+        print(f"[{split_idx}/{total_years}] Test year {split.test_year}")
         print(
-            f"Train: {split.train_start}-{split.train_end} | "
-            f"Val: {split.val_start}-{split.val_end} | "
-            f"Test: {split.test_start}-{split.test_end}"
+            f"  windows: train {split.train_start}-{split.train_end}  "
+            f"val {split.val_start}-{split.val_end}  "
+            f"test {split.test_start}-{split.test_end}"
         )
 
         train_generator = GKXDataGenerator(
@@ -1386,10 +1510,13 @@ def main():
                 tune_l1_lambdas=tune_l1_lambdas,
                 train_generator=train_generator,
                 val_generator=val_generator,
+                device=resolved_device,
             )
         )
 
-        predictions = _predict_ensemble(member_results, test_generator)
+        predictions = _predict_ensemble(
+            member_results, test_generator, device=resolved_device
+        )
         predictions["test_year"] = split.test_year
 
         split_eval = summarize_prediction_panel(predictions)
@@ -1455,9 +1582,8 @@ def main():
             is_complete=False,
         )
         print(
-            f"Test year {split.test_year} complete | "
-            f"mean best val loss {np.mean(member_val_losses):.6f} | "
-            f"test OOS R^2 {split_eval['overall_oos_r2']:.6f} | outputs refreshed"
+            f"  result: OOS R2 = {split_eval['overall_oos_r2'] * 100:+.4f}%   "
+            f"(mean val loss {np.mean(member_val_losses):.5f})  ·  outputs refreshed"
         )
 
     if input_features is None:

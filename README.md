@@ -267,6 +267,55 @@ python main.py --model NN1 --epochs 100 --batch_size 10000 \
   resume trains only the missing networks and reproduces the clean run's
   predictions exactly. Requires torch + pyarrow (i.e. run it on your machine).
 
+## Performance and device selection
+
+Two options control training speed, both chosen to be paper-faithful by default:
+
+- `--device {auto,cpu,mps,cuda}` (default `auto`, which picks mps > cuda > cpu).
+  Because the neural nets here are small, the per-batch overhead of Apple's MPS
+  backend can exceed its benefit, and on an 8 GB Mac MPS also competes for
+  unified memory. On Apple silicon, `--device cpu` (optionally with a larger
+  `--batch_size`, e.g. 30000) is often materially faster. On an NVIDIA machine
+  use `--device cuda`. The device is not part of the resume config guard, so a
+  run checkpointed on one machine can be continued on another.
+
+- Tune-then-ensemble (default). During validation grid search, each
+  hyperparameter candidate is evaluated by training a **single** network; the
+  full `--ensemble_size` ensemble is then trained **only at the selected
+  configuration** (member 0 from the grid is reused). This trains roughly
+  `n_grid + ensemble_size` networks per year instead of
+  `n_grid x ensemble_size`, a large saving with negligible effect on the final
+  forecast. The paper does not specify the interaction between tuning and
+  ensembling, so this is an efficiency choice, not a claim about the paper.
+  Pass `--full_ensemble_grid` to instead train the full ensemble at every grid
+  point (the older, more expensive behavior).
+
+Example, tuned CPU run on Apple silicon:
+
+```bash
+python main.py --model NN1 --device cpu --batch_size 30000 \
+  --tune_hyperparameters --tune_learning_rates 0.001,0.01 \
+  --tune_l1_lambdas 1e-5,3e-5,1e-4,3e-4,1e-3 \
+  --ensemble_size 10 --seed 42 \
+  --test_start_year 1987 --test_end_year 2016 \
+  --output_dir outputs/nn1_tuned_ensemble10_full
+```
+
+By default the console shows a compact, hierarchical progress view: a header
+with the run configuration, then per test year a one-line window summary, one
+line per tuning candidate (`[k/N] lr=… l1=… val=…`), the selected
+configuration, one line per ensemble network, and a one-line result. While a
+network trains, a heartbeat dot is printed per completed epoch (so a long,
+otherwise silent run visibly shows it is alive); disable these with
+`--no_progress`. Pass `--verbose` to restore the detailed per-epoch / per-batch
+training logs instead.
+
+To measure where time goes on your own hardware before a long run:
+
+```bash
+python profile_pipeline.py --device cpu --batch_size 30000
+```
+
 ## Outputs
 
 Each experiment writes output files such as:
@@ -326,14 +375,22 @@ Internet appendix:
 
 ```bash
 
-python main.py --model NN1 --epochs 100 --batch_size 10000 \
-  --tune_hyperparameters --tune_learning_rates 0.001,0.01 \
-  --tune_l1_lambdas 1e-5,3e-5,1e-4,3e-4,1e-3 \
-  --ensemble_size 10 --seed 42 \
-  --test_start_year 1987 --test_end_year 2016 \
+python main.py \
+  --model NN1 \
+  --device cpu \
+  --batch_size 10000 \
+  --epochs 100 \
   --early_stopping_patience 5 \
+  --tune_hyperparameters \
+  --tune_learning_rates 0.001,0.01 \
+  --tune_l1_lambdas 1e-5,3e-5,1e-4,3e-4,1e-3 \
+  --ensemble_size 10 \
+  --seed 42 \
+  --validation_years 12 \
+  --test_start_year 1987 \
+  --test_end_year 2016 \
   --decile_weight_col market_cap \
-  --output_dir outputs/nn1_tuned_ensemble10_full
+  --output_dir outputs/nn1_tuned_ensemble10_full_1987_2016
 
 # ... if it dies, run the identical command again to continue.
 ```

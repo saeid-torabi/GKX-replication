@@ -94,23 +94,13 @@ class GKXDataGenerator:
             + len(self.dummy_cols)
         )
 
-        print("DataGenerator initialized:")
-        print(f"  -> Connected to {filepath}")
-        if self.date_start is not None or self.date_end is not None:
-            print(
-                f"  -> Window: {self.date_start or '-inf'} to "
-                f"{self.date_end or '+inf'}"
-            )
-        print(f"  -> Total rows available: {self.total_rows:,}")
-        print(f"  -> Batch size: {self.batch_size:,}")
-        if self.shuffle:
-            print(f"  -> Shuffle buffer: {self.shuffle_buffer_batches} batches")
+        window = f"{self.date_start or '-inf'}-{self.date_end or '+inf'}"
+        shuffle_note = (
+            f", shuffle x{self.shuffle_buffer_batches}" if self.shuffle else ""
+        )
         print(
-            "  -> Feature blocks: "
-            f"{len(self.char_cols)} chars, "
-            f"{len(self.macro_cols)} macros, "
-            f"{len(self.dummy_cols)} dummies, "
-            f"{self.num_features} total features"
+            f"  [data] {window}: {self.total_rows:,} rows, "
+            f"{self.num_features} features, batch {self.batch_size:,}{shuffle_note}"
         )
 
     def _build_filter(self):
