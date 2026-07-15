@@ -745,6 +745,9 @@ def _write_outputs(
 
     all_histories = _histories_from_frame(learning_history_df)
     wealth_plot_path = _plot_wealth_growth(long_short, output_dir)
+    log_returns_path = _plot_cumulative_log_returns(
+        long_short, args.model, output_dir
+    )
     learning_curves_path = _plot_learning_curves(
         all_histories,
         args.model,
@@ -842,6 +845,7 @@ def _write_outputs(
         "output_files": {
             "predictions_parquet": str(predictions_path),
             "wealth_growth_png": str(wealth_plot_path),
+            "cumulative_log_returns_png": str(log_returns_path),
             "learning_curves_png": (
                 str(learning_curves_path) if learning_curves_path else None
             ),
@@ -859,6 +863,7 @@ def _write_outputs(
             "portfolio_performance_path": portfolio_performance_path,
             "long_short_path": long_short_path,
             "wealth_plot_path": wealth_plot_path,
+            "cumulative_log_returns_path": log_returns_path,
             "learning_curves_path": learning_curves_path,
         },
     }
@@ -947,20 +952,65 @@ def _metadata_cols(weight_col):
 
 
 def _plot_wealth_growth(long_short, output_dir):
-    wealth_df = long_short.copy()
+    wealth_df = long_short.dropna(subset=["long_short_10_1"]).copy()
     wealth_df["date"] = pd.to_datetime(
         wealth_df["YYYYMM"].astype(str),
         format="%Y%m",
     )
-    wealth_df["wealth"] = (1 + wealth_df["long_short_10_1"]).cumprod()
+    wealth_df = wealth_df.sort_values("date")
+    wealth = (1 + wealth_df["long_short_10_1"]).cumprod()
+
+    # Start the curve at exactly $1, one month before the first realized return.
+    start_date = wealth_df["date"].iloc[0] - pd.DateOffset(months=1)
+    dates = [start_date] + list(wealth_df["date"])
+    values = [1.0] + list(wealth)
 
     plt.figure(figsize=(10, 6))
-    plt.plot(wealth_df["date"], wealth_df["wealth"], linewidth=2)
-    plt.title("Cumulative Wealth Growth")
-    plt.ylabel("Portfolio Value ($)")
+    plt.plot(dates, values, linewidth=2)
+    plt.title("Long-Short (10-1) Cumulative Return — gross of costs")
+    plt.ylabel("Growth of $1 (gross, zero-cost long-short)")
+    plt.xlabel("Date")
     plt.grid(True, alpha=0.3)
 
     output_path = output_dir / "wealth_growth.png"
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return output_path
+
+
+def _plot_cumulative_log_returns(long_short, model_name, output_dir):
+    """GKX Figure 9 style: cumulative log returns of the top decile (long, solid)
+    and bottom decile (short, dashed), value-weighted, on a log-return basis."""
+    df = long_short.dropna(subset=[1, 10]).copy()
+    df["date"] = pd.to_datetime(df["YYYYMM"].astype(str), format="%Y%m")
+    df = df.sort_values("date")
+
+    # Cumulative log return = cumsum(log(1 + r)); log-growth of $1 starts at 0.
+    long_cum = np.log1p(df[10].astype(float)).cumsum()
+    short_cum = np.log1p(df[1].astype(float)).cumsum()
+
+    start_date = df["date"].iloc[0] - pd.DateOffset(months=1)
+    dates = [start_date] + list(df["date"])
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(dates, [0.0] + list(long_cum), linewidth=2, label="Long (top decile)")
+    plt.plot(
+        dates,
+        [0.0] + list(short_cum),
+        linewidth=2,
+        linestyle="--",
+        label="Short (bottom decile)",
+    )
+    plt.title(
+        f"{model_name} — cumulative log returns of prediction-sorted portfolios"
+    )
+    plt.ylabel("Cumulative log return")
+    plt.xlabel("Date")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+
+    output_path = output_dir / f"{model_name.lower()}_cumulative_log_returns.png"
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close()
 
@@ -1019,6 +1069,26 @@ def _plot_learning_curves(all_histories, model_name, output_dir):
                 label="Val MSE",
                 linewidth=2,
             )
+            # Mark the lowest-validation-MSE epoch: the point early stopping
+            # selects and whose weights are actually used for prediction.
+            val_history = history_df.dropna(subset=["val_loss"])
+            best_row = val_history.loc[val_history["val_loss"].idxmin()]
+            best_epoch = int(round(best_row["epoch"]))
+            ax.axvline(
+                best_row["epoch"],
+                color="gray",
+                linestyle=":",
+                linewidth=1.2,
+                alpha=0.8,
+            )
+            ax.scatter(
+                [best_row["epoch"]],
+                [best_row["val_loss"]],
+                color="crimson",
+                s=35,
+                zorder=5,
+                label=f"Best epoch ({best_epoch})",
+            )
 
         ax.set_title(f"Test Year {split_history['test_year']}")
         ax.set_xlabel("Epoch")
@@ -1060,7 +1130,7 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=5,
+        default=100,
         help="Number of training epochs per recursive split.",
     )
     parser.add_argument(
