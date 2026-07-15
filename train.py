@@ -27,35 +27,6 @@ def get_device(device=None):
     return "cpu"
 
 
-def _tensor_stats(tensor):
-    tensor = tensor.detach()
-    return {
-        "min": tensor.min().item(),
-        "max": tensor.max().item(),
-        "mean": tensor.mean().item(),
-        "std": tensor.std(unbiased=False).item(),
-    }
-
-
-def _format_stats(name, stats):
-    return (
-        f"{name}[min={stats['min']:.6g}, "
-        f"max={stats['max']:.6g}, "
-        f"mean={stats['mean']:.6g}, "
-        f"std={stats['std']:.6g}]"
-    )
-
-
-def _gradient_norm(model):
-    total_sq_norm = 0.0
-    for parameter in model.parameters():
-        if parameter.grad is None:
-            continue
-        param_norm = parameter.grad.detach().data.norm(2).item()
-        total_sq_norm += param_norm ** 2
-    return total_sq_norm ** 0.5
-
-
 def _l1_regularized_parameters(model):
     """
     Yield weight tensors covered by the GKX-style l1 penalty.
@@ -79,44 +50,24 @@ def _l1_penalty(model, device):
     return penalty
 
 
-def evaluate_loss(model, generator, device, max_batches=None, collect_diagnostics=False):
+def evaluate_loss(model, generator, device):
+    """Mean predictive MSE over ``generator`` (no regularization)."""
     model.eval()
-    # Validation reports predictive MSE; regularization is applied only in training.
     loss_fn = torch.nn.MSELoss()
     running_loss = 0.0
     batches_seen = 0
-    prediction_chunks = []
-    target_chunks = []
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(generator, start=1):
+        for batch in generator:
             x_batch, y_batch = batch[:2]
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
 
             predictions = model(x_batch)
-            loss = loss_fn(predictions, y_batch)
+            running_loss += loss_fn(predictions, y_batch).item()
+            batches_seen += 1
 
-            running_loss += loss.item()
-            batches_seen = batch_idx
-            if collect_diagnostics:
-                prediction_chunks.append(predictions.detach().cpu().reshape(-1))
-                target_chunks.append(y_batch.detach().cpu().reshape(-1))
-
-            if max_batches is not None and batch_idx >= max_batches:
-                break
-
-    val_loss = running_loss / batches_seen
-    if not collect_diagnostics:
-        return val_loss
-
-    prediction_tensor = torch.cat(prediction_chunks)
-    target_tensor = torch.cat(target_chunks)
-    return {
-        "loss": val_loss,
-        "prediction_stats": _tensor_stats(prediction_tensor),
-        "target_stats": _tensor_stats(target_tensor),
-    }
+    return running_loss / batches_seen
 
 
 def train_model(
@@ -125,17 +76,16 @@ def train_model(
     epochs,
     learning_rate=1e-3,
     device=None,
-    log_every=50,
-    max_train_batches=None,
     val_generator=None,
-    max_val_batches=None,
     early_stopping_patience=5,
     early_stopping_min_delta=0.0,
-    log_diagnostics=False,
     l1_lambda=1e-5,
-    verbose=False,
-    heartbeat=False,
 ):
+    """Fit one network with Adam on an MSE + L1 objective, keeping the best
+    epoch by validation loss and supporting early stopping.
+
+    Prints one flushed '.' per completed epoch as a liveness heartbeat.
+    """
     if l1_lambda < 0:
         raise ValueError("l1_lambda must be non-negative.")
 
@@ -145,17 +95,6 @@ def train_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     # The paper's NN objective is MSE plus an l1 penalty, not Huber.
     loss_fn = torch.nn.MSELoss()
-    l1_parameter_names = [name for name, _ in _l1_regularized_parameters(model)]
-    if verbose:
-        print(f"Training on device: {device}")
-        if l1_lambda > 0:
-            print(
-                "L1 regularization enabled: "
-                f"lambda={l1_lambda:.6g}, "
-                f"regularized_weight_tensors={len(l1_parameter_names)}"
-            )
-        else:
-            print("L1 regularization disabled: lambda=0")
 
     history = []
     best_metric = None
@@ -171,7 +110,7 @@ def train_model(
         running_l1_penalty = 0.0
         batches_seen = 0
 
-        for batch_idx, (x_batch, y_batch) in enumerate(train_generator, start=1):
+        for x_batch, y_batch in train_generator:
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
 
@@ -184,103 +123,27 @@ def train_model(
                 l1_penalty = torch.zeros((), device=device)
             loss = mse_loss + (l1_lambda * l1_penalty)
             loss.backward()
-            grad_norm = _gradient_norm(model)
             optimizer.step()
 
             running_mse += mse_loss.item()
             running_objective += loss.item()
             running_l1_penalty += l1_penalty.item()
-            batches_seen = batch_idx
-
-            if verbose and (
-                batch_idx % log_every == 0 or batch_idx == len(train_generator)
-            ):
-                log_parts = [
-                    f"epoch={epoch:03d}/{epochs:03d}",
-                    f"batch={batch_idx:05d}/{len(train_generator):05d}",
-                    f"avg_train_mse={running_mse / batch_idx:.6f}",
-                ]
-                if l1_lambda > 0:
-                    log_parts.extend(
-                        [
-                            f"avg_train_objective={running_objective / batch_idx:.6f}",
-                            f"avg_l1_penalty={running_l1_penalty / batch_idx:.6f}",
-                        ]
-                    )
-                if log_diagnostics:
-                    log_parts.append(f"grad_l2={grad_norm:.6g}")
-                print(" | ".join(log_parts))
-
-            if max_train_batches is not None and batch_idx >= max_train_batches:
-                if verbose:
-                    print(
-                        f"Stopped early after {batch_idx} training batches "
-                        "for this epoch."
-                    )
-                break
+            batches_seen += 1
 
         train_loss = running_mse / batches_seen
         train_objective = running_objective / batches_seen
         train_l1_penalty = running_l1_penalty / batches_seen
 
         if val_generator is not None:
-            val_result = evaluate_loss(
-                model=model,
-                generator=val_generator,
-                device=device,
-                max_batches=max_val_batches,
-                collect_diagnostics=log_diagnostics,
-            )
-            if log_diagnostics:
-                val_loss = val_result["loss"]
-                prediction_stats = val_result["prediction_stats"]
-                target_stats = val_result["target_stats"]
-            else:
-                val_loss = val_result
+            val_loss = evaluate_loss(model, val_generator, device)
             selection_metric = val_loss
-            log_parts = [
-                f"epoch={epoch:03d} complete",
-                f"train_mse={train_loss:.6f}",
-            ]
-            if l1_lambda > 0:
-                log_parts.extend(
-                    [
-                        f"train_objective={train_objective:.6f}",
-                        f"l1_penalty={train_l1_penalty:.6f}",
-                    ]
-                )
-            log_parts.append(f"val_loss={val_loss:.6f}")
-            if log_diagnostics:
-                log_parts.extend(
-                    [
-                        _format_stats("val_pred", prediction_stats),
-                        _format_stats("val_target", target_stats),
-                    ]
-                )
-            if verbose:
-                print(" | ".join(log_parts))
         else:
             val_loss = None
             selection_metric = train_loss
-            log_parts = [
-                f"epoch={epoch:03d} complete",
-                f"train_mse={train_loss:.6f}",
-            ]
-            if l1_lambda > 0:
-                log_parts.extend(
-                    [
-                        f"train_objective={train_objective:.6f}",
-                        f"l1_penalty={train_l1_penalty:.6f}",
-                    ]
-                )
-            if verbose:
-                print(" | ".join(log_parts))
 
-        # Heartbeat: one flushed mark per completed epoch so a long, otherwise
-        # silent run visibly shows it is alive. Suppressed under verbose (which
-        # already prints a full line per epoch).
-        if heartbeat and not verbose:
-            print(".", end="", flush=True)
+        # Heartbeat: one flushed mark per completed epoch so a long run visibly
+        # shows it is alive.
+        print(".", end="", flush=True)
 
         improved = (
             best_metric is None
@@ -316,13 +179,6 @@ def train_model(
             and patience_counter >= early_stopping_patience
         ):
             early_stopped = True
-            if verbose:
-                print(
-                    "Early stopping triggered: "
-                    f"validation loss failed to improve by more than "
-                    f"{early_stopping_min_delta:.6f} for "
-                    f"{early_stopping_patience} consecutive epochs."
-                )
             break
 
     if best_state_dict is not None:
@@ -359,7 +215,7 @@ def predict_model(model, generator, device=None, prediction_col="prediction"):
     return pd.concat(outputs, ignore_index=True)
 
 
-def predict_values(model, generator, device=None, max_batches=None):
+def predict_values(model, generator, device=None):
     device = get_device(device)
     model = model.to(device)
     model.eval()
@@ -368,15 +224,12 @@ def predict_values(model, generator, device=None, max_batches=None):
     target_chunks = []
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(generator, start=1):
+        for batch in generator:
             x_batch, y_batch = batch[:2]
             predictions = model(x_batch.to(device)).cpu().numpy().reshape(-1)
             targets = y_batch.cpu().numpy().reshape(-1)
             prediction_chunks.append(predictions)
             target_chunks.append(targets)
-
-            if max_batches is not None and batch_idx >= max_batches:
-                break
 
     return (
         np.concatenate(prediction_chunks),

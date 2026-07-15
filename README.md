@@ -150,10 +150,11 @@ python -m pip install numpy pandas pyarrow torch matplotlib
 
 ## Quick Smoke Test
 
-Run a one-year, one-batch smoke test:
+Run a fast one-year check (single network, no tuning) to confirm the pipeline
+works end to end:
 
 ```bash
-python main.py --model NN1 --epochs 1 --batch_size 2048 --l1_lambda 1e-5 --max_train_batches 1 --max_val_batches 1 --max_test_years 1 --output_dir /tmp/gkx_smoke
+python main.py --model NN1 --epochs 5 --ensemble_size 1 --max_test_years 1 --output_dir /tmp/gkx_smoke
 ```
 
 This checks that:
@@ -222,8 +223,7 @@ close, a laptop restart, or a failure at hour 200 no longer throws away the work
 
 How it works:
 
-- A `checkpoints/` folder is created inside `--output_dir` (override with
-  `--checkpoint_dir`).
+- A `checkpoints/` folder is created inside `--output_dir`.
 - Training is checkpointed at **ensemble-member granularity**. After each member
   of each hyperparameter combination is trained, its weights and history are
   saved. After a combination finishes, a `combo.json` marker records its
@@ -301,14 +301,12 @@ python main.py --model NN1 --device cpu --batch_size 30000 \
   --output_dir outputs/nn1_tuned_ensemble10_full
 ```
 
-By default the console shows a compact, hierarchical progress view: a header
-with the run configuration, then per test year a one-line window summary, one
-line per tuning candidate (`[k/N] lr=… l1=… val=…`), the selected
-configuration, one line per ensemble network, and a one-line result. While a
-network trains, a heartbeat dot is printed per completed epoch (so a long,
-otherwise silent run visibly shows it is alive); disable these with
-`--no_progress`. Pass `--verbose` to restore the detailed per-epoch / per-batch
-training logs instead.
+The console shows a compact, hierarchical progress view: a header with the run
+configuration, then per test year a one-line window summary, one line per tuning
+candidate (`[k/N] lr=… l1=… val=…`), the selected configuration, one line per
+ensemble network, and a one-line result. While a network trains, a heartbeat dot
+is printed per completed epoch so a long, otherwise silent run visibly shows it
+is alive.
 
 To measure where time goes on your own hardware before a long run:
 

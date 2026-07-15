@@ -341,8 +341,6 @@ def _config_identity(args, tune_learning_rates, tune_l1_lambdas):
         "early_stopping_min_delta": float(args.early_stopping_min_delta),
         "no_shuffle_train": bool(args.no_shuffle_train),
         "shuffle_buffer_batches": args.shuffle_buffer_batches,
-        "max_train_batches": args.max_train_batches,
-        "max_val_batches": args.max_val_batches,
         "max_test_years": args.max_test_years,
         "decile_weight_col": args.decile_weight_col,
     }
@@ -471,7 +469,6 @@ def _train_ensemble_resumable(
     trained as the full ensemble."""
     member_results = []
     member_histories = []
-    heartbeat = (not args.no_progress) and (not args.verbose)
 
     for member_idx in range(n_members):
         member_number = member_idx + 1
@@ -490,9 +487,9 @@ def _train_ensemble_resumable(
                     f"loaded from checkpoint  (val {best_metric_str})"
                 )
         else:
-            # When showing a per-net line with heartbeat dots, print the prefix
-            # now (no newline) so the dots stream right after it.
-            if not quiet and heartbeat:
+            # Print the per-net prefix now (no newline) so the heartbeat dots
+            # from train_model stream right after it.
+            if not quiet:
                 print(
                     f"      net {member_number}/{n_members}  ", end="", flush=True
                 )
@@ -508,15 +505,10 @@ def _train_ensemble_resumable(
                 val_generator=val_generator,
                 epochs=args.epochs,
                 learning_rate=learning_rate,
-                max_train_batches=args.max_train_batches,
-                max_val_batches=args.max_val_batches,
                 early_stopping_patience=args.early_stopping_patience,
                 early_stopping_min_delta=args.early_stopping_min_delta,
-                log_diagnostics=args.log_diagnostics,
                 l1_lambda=l1_lambda,
                 device=device,
-                verbose=args.verbose,
-                heartbeat=heartbeat,
             )
             _save_member_checkpoint(
                 path=member_path,
@@ -535,15 +527,11 @@ def _train_ensemble_resumable(
                 "history": train_result["history"],
             }
             if not quiet:
-                summary = (
-                    f"val {train_result['best_metric']:.5f}  "
+                print(
+                    f"  val {train_result['best_metric']:.5f}  "
                     f"(best epoch {train_result['best_epoch']}, "
                     f"{train_result['epochs_trained']} ep)"
                 )
-                if heartbeat:
-                    print(f"  {summary}")
-                else:
-                    print(f"      net {member_number}/{n_members}  {summary}")
 
         member_results.append(train_result)
         member_histories.append(member_history)
@@ -596,7 +584,6 @@ def _run_year_resumable(
     else:
         grid_members = args.ensemble_size
 
-    heartbeat = (not args.no_progress) and (not args.verbose)
     tuning_rows = []
     best_combo = None
 
@@ -622,7 +609,7 @@ def _run_year_resumable(
                 )
                 print(f"{tag}   {loss_str}  (cached)")
         else:
-            if args.tune_hyperparameters and heartbeat:
+            if args.tune_hyperparameters:
                 print(f"{tag}   ", end="", flush=True)
             member_results, _member_histories = _train_ensemble_resumable(
                 args=args,
@@ -643,7 +630,6 @@ def _run_year_resumable(
                 candidate_ensemble_loss = _ensemble_validation_loss(
                     member_results=member_results,
                     val_generator=val_generator,
-                    max_val_batches=args.max_val_batches,
                     device=device,
                 )
                 tuning_row = {
@@ -667,10 +653,7 @@ def _run_year_resumable(
                     ),
                 }
                 tuning_rows.append(tuning_row)
-                if heartbeat:
-                    print(f"  val={candidate_ensemble_loss:.5f}")
-                else:
-                    print(f"{tag}   val={candidate_ensemble_loss:.5f}")
+                print(f"  val={candidate_ensemble_loss:.5f}")
             else:
                 candidate_ensemble_loss = None
 
@@ -921,61 +904,6 @@ def _refresh_outputs_from_checkpoints(
     )
 
 
-def _train_ensemble(
-    args,
-    train_generator,
-    val_generator,
-    input_features,
-    learning_rate,
-    l1_lambda,
-):
-    member_results = []
-    member_histories = []
-
-    for member_idx in range(args.ensemble_size):
-        member_number = member_idx + 1
-        member_seed = args.seed + member_idx
-        print(
-            f"Ensemble member {member_number}/{args.ensemble_size} | "
-            f"seed={member_seed} | lr={learning_rate} | l1_lambda={l1_lambda}"
-        )
-        _set_global_seed(member_seed)
-
-        model = build_neural_net(
-            architecture=args.model,
-            input_features=input_features,
-        )
-
-        train_result = train_model(
-            model=model,
-            train_generator=train_generator,
-            val_generator=val_generator,
-            epochs=args.epochs,
-            learning_rate=learning_rate,
-            max_train_batches=args.max_train_batches,
-            max_val_batches=args.max_val_batches,
-            early_stopping_patience=args.early_stopping_patience,
-            early_stopping_min_delta=args.early_stopping_min_delta,
-            log_diagnostics=args.log_diagnostics,
-            l1_lambda=l1_lambda,
-        )
-
-        member_results.append(train_result)
-        member_histories.append(
-            {
-                "ensemble_member": member_number,
-                "seed": member_seed,
-                "history": train_result["history"],
-            }
-        )
-        print(
-            f"Ensemble member {member_number}/{args.ensemble_size} complete | "
-            f"best val loss {train_result['best_metric']:.6f}"
-        )
-
-    return member_results, member_histories
-
-
 def _predict_ensemble(member_results, test_generator, device=None):
     member_predictions = []
     for train_result in member_results:
@@ -988,9 +916,7 @@ def _predict_ensemble(member_results, test_generator, device=None):
     return _average_ensemble_predictions(member_predictions)
 
 
-def _ensemble_validation_loss(
-    member_results, val_generator, max_val_batches=None, device=None
-):
+def _ensemble_validation_loss(member_results, val_generator, device=None):
     prediction_arrays = []
     targets = None
 
@@ -998,7 +924,6 @@ def _ensemble_validation_loss(
         member_predictions, member_targets = predict_values(
             model=train_result["model"],
             generator=val_generator,
-            max_batches=max_val_batches,
             device=device,
         )
         if targets is None:
@@ -1230,18 +1155,6 @@ def main():
         help="Width of the rolling validation window in years.",
     )
     parser.add_argument(
-        "--max_train_batches",
-        type=int,
-        default=None,
-        help="Optional cap on training batches per epoch for smoke tests.",
-    )
-    parser.add_argument(
-        "--max_val_batches",
-        type=int,
-        default=None,
-        help="Optional cap on validation batches per epoch for smoke tests.",
-    )
-    parser.add_argument(
         "--early_stopping_patience",
         type=int,
         default=5,
@@ -1257,14 +1170,6 @@ def main():
         help=(
             "Minimum drop in validation loss required to reset the early "
             "stopping patience counter."
-        ),
-    )
-    parser.add_argument(
-        "--log_diagnostics",
-        action="store_true",
-        help=(
-            "Log gradient norms plus validation prediction/target summary "
-            "statistics for diagnosing unstable NN training."
         ),
     )
     parser.add_argument(
@@ -1297,16 +1202,10 @@ def main():
         "--output_dir",
         type=str,
         default="outputs",
-        help="Directory to store predictions and summary files.",
-    )
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default="checkpoints",
         help=(
-            "Directory for resumable checkpoints. Relative paths are placed "
-            "inside --output_dir. A run auto-resumes from here if it already "
-            "contains checkpoints for a matching configuration."
+            "Directory to store predictions and summary files. Resumable "
+            "checkpoints are written to a 'checkpoints' subfolder here, and a "
+            "run auto-resumes from them if the configuration matches."
         ),
     )
     parser.add_argument(
@@ -1346,23 +1245,6 @@ def main():
             "Place batch normalization BEFORE the ReLU (Linear->BN->ReLU). The "
             "default follows GKX Internet Appendix B.3, which applies batch "
             "normalization AFTER the ReLU (Linear->ReLU->BN)."
-        ),
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help=(
-            "Print detailed per-epoch / per-batch training logs. Off by default; "
-            "the progress output shows one compact line per tuning candidate and "
-            "a summary per test year."
-        ),
-    )
-    parser.add_argument(
-        "--no_progress",
-        action="store_true",
-        help=(
-            "Disable the per-epoch heartbeat dots. By default each network prints "
-            "one '.' per completed epoch so a long run visibly shows it is alive."
         ),
     )
 
@@ -1421,7 +1303,7 @@ def main():
     if args.max_test_years is not None:
         splits = splits[: args.max_test_years]
 
-    checkpoint_dir = _resolve_checkpoint_dir(output_dir, args.checkpoint_dir)
+    checkpoint_dir = _resolve_checkpoint_dir(output_dir, "checkpoints")
     identity = _config_identity(args, tune_learning_rates, tune_l1_lambdas)
 
     if args.force_restart and checkpoint_dir.exists():
@@ -1440,7 +1322,7 @@ def main():
                 "Refusing to resume: the requested configuration differs from "
                 f"the checkpointed run at {checkpoint_dir}:\n{diff_lines}\n"
                 "Re-run with --force_restart to discard those checkpoints and "
-                "start over, or choose a new --output_dir/--checkpoint_dir."
+                "start over, or choose a new --output_dir."
             )
     _write_run_config(checkpoint_dir, identity)
 
