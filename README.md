@@ -290,6 +290,30 @@ Two options control training speed, both chosen to be paper-faithful by default:
   Pass `--full_ensemble_grid` to instead train the full ensemble at every grid
   point (the older, more expensive behavior).
 
+- `--parallel_nets K` (default 1) trains up to K networks **concurrently** on a
+  GPU by stacking them into one batched forward/backward pass. A single GKX
+  network barely occupies a GPU, so training one-at-a-time wastes the device;
+  training the ensemble members together is a large speedup, and it pairs
+  naturally with `--full_ensemble_grid` (every hyperparameter combination trains
+  its full ensemble at once). It loads the split's data into device memory, so
+  use it only on a machine with ample GPU/RAM (`--device cuda`). Each network
+  keeps its own seed, shuffle, batch-norm and early stopping, so the result is a
+  faithful ensemble draw — not bit-identical to a sequential CPU run, because the
+  per-network shuffle stream and batched floating-point order differ. On startup
+  the parallel trainer runs a self-check that verifies its vectorized
+  forward/backward against reference networks and aborts if they disagree.
+
+Example, parallel full-grid run on a GPU box:
+
+```bash
+python main.py --model NN1 --device cuda --batch_size 10000 \
+  --tune_hyperparameters --full_ensemble_grid --parallel_nets 10 \
+  --tune_learning_rates 0.001,0.01 --tune_l1_lambdas 1e-5,3e-5,1e-4,3e-4,1e-3 \
+  --ensemble_size 10 --seed 42 \
+  --test_start_year 1987 --test_end_year 2016 \
+  --output_dir outputs/nn1_fullgrid_parallel
+```
+
 Example, tuned CPU run on Apple silicon:
 
 ```bash

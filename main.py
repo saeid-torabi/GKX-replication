@@ -56,8 +56,9 @@ from backtest import build_long_short_deciles, summarize_decile_performance
 from data_generator import GKXDataGenerator
 from evaluate import summarize_prediction_panel
 from models import build_neural_net
+from parallel_train import materialize_dataset, train_parallel_members
 from splits import generate_gkx_splits
-from train import predict_model, predict_values, train_model
+from train import get_device, predict_model, predict_values, train_model
 
 
 def _set_global_seed(seed):
@@ -368,6 +369,7 @@ def _config_identity(args, tune_learning_rates, tune_l1_lambdas):
         "tune_l1_lambdas": [float(x) for x in tune_l1_lambdas],
         "full_ensemble_grid": bool(args.full_ensemble_grid),
         "batchnorm_before_relu": bool(args.batchnorm_before_relu),
+        "parallel_nets": int(args.parallel_nets),
         "ensemble_size": args.ensemble_size,
         "seed": args.seed,
         "test_start_year": args.test_start_year,
@@ -503,6 +505,12 @@ def _train_ensemble_resumable(
     ``n_members`` is decoupled from ``args.ensemble_size`` so grid-search tuning
     can train a single network per candidate while the final selected model is
     trained as the full ensemble."""
+    if args.parallel_nets > 1 and n_members > 1:
+        return _train_ensemble_parallel(
+            args, combo_dir, train_generator, val_generator, input_features,
+            learning_rate, l1_lambda, n_members, device, quiet,
+        )
+
     member_results = []
     member_histories = []
 
@@ -571,6 +579,112 @@ def _train_ensemble_resumable(
 
         member_results.append(train_result)
         member_histories.append(member_history)
+
+    return member_results, member_histories
+
+
+def _train_ensemble_parallel(
+    args,
+    combo_dir,
+    train_generator,
+    val_generator,
+    input_features,
+    learning_rate,
+    l1_lambda,
+    n_members,
+    device,
+    quiet,
+):
+    """Parallel (GPU) counterpart of _train_ensemble_resumable: load any cached
+    members, then train the rest concurrently in groups of --parallel_nets,
+    saving each to the same per-member checkpoint format so resume/prediction
+    are unchanged."""
+    member_results = [None] * n_members
+    member_histories = [None] * n_members
+    to_train = []
+    for member_idx in range(n_members):
+        member_path = _member_checkpoint_path(combo_dir, member_idx)
+        if member_path.exists():
+            train_result, member_history = _load_member_checkpoint(member_path)
+            member_results[member_idx] = train_result
+            member_histories[member_idx] = member_history
+            if not quiet:
+                bm = train_result["best_metric"]
+                bm_str = f"{bm:.5f}" if bm is not None else "n/a"
+                print(
+                    f"      net {member_idx + 1}/{n_members}  "
+                    f"loaded from checkpoint  (val {bm_str})"
+                )
+        else:
+            to_train.append(member_idx)
+
+    if not to_train:
+        return member_results, member_histories
+
+    dev = get_device(device)
+    train_x, train_y = materialize_dataset(train_generator, dev)
+    val_x, val_y = materialize_dataset(val_generator, dev)
+    try:
+        first_group = True
+        for g0 in range(0, len(to_train), args.parallel_nets):
+            group = to_train[g0:g0 + args.parallel_nets]
+            specs = [(idx + 1, args.seed + idx) for idx in group]
+            if not quiet:
+                nums = ",".join(str(i + 1) for i in group)
+                print(
+                    f"      nets {nums}/{n_members}  training in parallel "
+                    f"on {dev} ...",
+                    flush=True,
+                )
+            results = train_parallel_members(
+                architecture=args.model,
+                input_features=input_features,
+                member_specs=specs,
+                train_x=train_x,
+                train_y=train_y,
+                val_x=val_x,
+                val_y=val_y,
+                epochs=args.epochs,
+                learning_rate=learning_rate,
+                l1_lambda=l1_lambda,
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_min_delta=args.early_stopping_min_delta,
+                device=dev,
+                batchnorm_after_relu=not args.batchnorm_before_relu,
+                batch_size=args.batch_size,
+                run_self_check=first_group,
+            )
+            first_group = False
+            for member_idx, train_result in zip(group, results):
+                member_number = member_idx + 1
+                member_seed = args.seed + member_idx
+                _save_member_checkpoint(
+                    path=_member_checkpoint_path(combo_dir, member_idx),
+                    train_result=train_result,
+                    member_number=member_number,
+                    seed=member_seed,
+                    learning_rate=learning_rate,
+                    l1_lambda=l1_lambda,
+                    input_features=input_features,
+                    architecture=args.model,
+                    batchnorm_after_relu=not args.batchnorm_before_relu,
+                )
+                member_results[member_idx] = train_result
+                member_histories[member_idx] = {
+                    "ensemble_member": member_number,
+                    "seed": member_seed,
+                    "history": train_result["history"],
+                }
+                if not quiet:
+                    print(
+                        f"      net {member_number}/{n_members}  "
+                        f"val {train_result['best_metric']:.5f}  "
+                        f"(best epoch {train_result['best_epoch']}, "
+                        f"{train_result['epochs_trained']} ep)"
+                    )
+    finally:
+        del train_x, train_y, val_x, val_y
+        _clear_accelerator_cache()
 
     return member_results, member_histories
 
@@ -1353,8 +1467,24 @@ def main():
             "normalization AFTER the ReLU (Linear->ReLU->BN)."
         ),
     )
+    parser.add_argument(
+        "--parallel_nets",
+        type=int,
+        default=1,
+        help=(
+            "Train up to this many networks concurrently on the GPU by stacking "
+            "them into one batched forward/backward pass (a large speedup when a "
+            "single network underuses the device). 1 = the standard sequential "
+            "path (default). Requires holding the split's data in device memory, "
+            "so use it only on a machine with ample GPU/RAM. Each network keeps "
+            "its own seed, shuffle, batch-norm and early stopping, so the result "
+            "is a faithful ensemble draw (not bit-identical to a sequential run)."
+        ),
+    )
 
     args = parser.parse_args()
+    if args.parallel_nets < 1:
+        raise ValueError("--parallel_nets must be at least 1.")
     if args.l1_lambda < 0:
         raise ValueError("--l1_lambda must be non-negative.")
     if args.ensemble_size < 1:
@@ -1400,6 +1530,11 @@ def main():
         f"(min_delta={args.early_stopping_min_delta:g})  ·  {bn_order}  ·  "
         f"{tune_mode}"
     )
+    if args.parallel_nets > 1:
+        print(
+            f"  parallel: up to {args.parallel_nets} networks trained "
+            "concurrently (GPU, device-resident data)"
+        )
     if args.tune_hyperparameters:
         print(f"  grid: lr {tune_learning_rates}  x  l1 {tune_l1_lambdas}")
     print(f"  log: {output_dir / (args.model.lower() + '_run.log')}")
