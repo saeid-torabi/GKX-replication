@@ -4,12 +4,48 @@ from itertools import product
 import json
 import random
 import shutil
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
 import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+
+class _Tee:
+    """Mirror everything written to stdout into a log file as well, so the full
+    console output is saved to <output_dir>/<model>_run.log after a run."""
+
+    def __init__(self, stream, file_handle):
+        self._stream = stream
+        self._file = file_handle
+
+    def write(self, data):
+        self._stream.write(data)
+        self._file.write(data)
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._file.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _start_console_log(log_path):
+    """Redirect stdout through a tee that also appends to log_path. Returns the
+    file handle so it can be flushed at the end of the run."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handle = open(log_path, "a", encoding="utf-8")
+    file_handle.write(
+        f"\n{'=' * 72}\n"
+        f"# run started {datetime.now().isoformat(timespec='seconds')}\n"
+    )
+    sys.stdout = _Tee(sys.stdout, file_handle)
+    return file_handle
 
 try:
     import torch
@@ -1342,6 +1378,12 @@ def main():
     else:
         tune_mode = "fixed hyperparameters"
 
+    start_time = time.time()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Tee stdout to a log file so the full console output is saved with the run.
+    log_file = _start_console_log(output_dir / f"{args.model.lower()}_run.log")
+
     print("=" * 72)
     print(
         f"GKX {args.model} — recursive experiment "
@@ -1360,10 +1402,7 @@ def main():
     )
     if args.tune_hyperparameters:
         print(f"  grid: lr {tune_learning_rates}  x  l1 {tune_l1_lambdas}")
-
-    start_time = time.time()
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  log: {output_dir / (args.model.lower() + '_run.log')}")
 
     splits = generate_gkx_splits(
         test_start_year=args.test_start_year,
@@ -1583,6 +1622,7 @@ def main():
         tune_learning_rates=tune_learning_rates,
         tune_l1_lambdas=tune_l1_lambdas,
     )
+    log_file.flush()
 
 
 def _print_final_summary(
