@@ -137,36 +137,6 @@ def _average_ensemble_predictions(member_predictions):
     return base
 
 
-def _average_member_histories(member_histories):
-    if len(member_histories) == 1:
-        return member_histories[0]["history"]
-
-    history_frames = []
-    for member_history in member_histories:
-        frame = pd.DataFrame(member_history["history"])
-        frame["ensemble_member"] = member_history["ensemble_member"]
-        frame["seed"] = member_history["seed"]
-        history_frames.append(frame)
-
-    combined = pd.concat(history_frames, ignore_index=True)
-    metric_cols = [
-        col
-        for col in [
-            "train_loss",
-            "train_objective",
-            "l1_penalty",
-            "val_loss",
-            "selection_metric",
-            "best_metric",
-            "best_epoch",
-            "patience_counter",
-        ]
-        if col in combined.columns
-    ]
-    averaged = combined.groupby("epoch", as_index=False)[metric_cols].mean()
-    return averaged.to_dict(orient="records")
-
-
 def _member_val_losses(member_results):
     return [
         result["best_metric"]
@@ -180,16 +150,6 @@ def _mean_result_field(member_results, field):
     if not values:
         return None
     return float(np.mean(values))
-
-
-def _flatten_histories(all_histories):
-    rows = []
-    for split_history in all_histories:
-        for row in split_history["history"]:
-            output_row = {"test_year": split_history["test_year"]}
-            output_row.update(row)
-            rows.append(output_row)
-    return pd.DataFrame(rows)
 
 
 def _resolve_checkpoint_dir(output_dir, checkpoint_dir):
@@ -326,6 +286,9 @@ def _read_checkpoint_table(checkpoint_dir, model_name, table_name):
 
 
 def _histories_from_frame(history_frame):
+    """Split the saved learning history into one frame per test year. Each frame
+    holds one row per (ensemble_member, epoch) so the plot can summarise across
+    members rather than relying on a pre-averaged curve."""
     if history_frame.empty:
         return []
     histories = []
@@ -333,7 +296,7 @@ def _histories_from_frame(history_frame):
         histories.append(
             {
                 "test_year": int(test_year),
-                "history": frame.drop(columns=["test_year"]).to_dict(orient="records"),
+                "frame": frame.drop(columns=["test_year"]).reset_index(drop=True),
             }
         )
     return histories
@@ -1184,72 +1147,114 @@ def _plot_learning_curves(all_histories, model_name, output_dir):
     axes = axes.flatten()
 
     for ax, split_history in zip(axes, all_histories):
-        history_df = pd.DataFrame(split_history["history"])
+        history_df = split_history["frame"]
+        if "ensemble_member" in history_df.columns:
+            n_members = int(history_df["ensemble_member"].nunique())
+        else:
+            history_df = history_df.assign(ensemble_member=1)
+            n_members = 1
+
+        by_epoch = history_df.groupby("epoch")
+        epochs = by_epoch["val_loss"].median().index
+
         has_train_objective = (
             "train_objective" in history_df.columns
             and history_df["train_objective"].notna().any()
         )
         if has_train_objective:
             ax.plot(
-                history_df["epoch"],
-                history_df["train_objective"],
-                label="Train Objective",
+                epochs,
+                by_epoch["train_objective"].median(),
+                label="Train objective",
                 linewidth=2,
             )
             ax.plot(
-                history_df["epoch"],
-                history_df["train_loss"],
+                epochs,
+                by_epoch["train_loss"].median(),
                 label="Train MSE",
-                linewidth=1.5,
+                linewidth=1.4,
                 linestyle="--",
                 alpha=0.75,
             )
         else:
             ax.plot(
-                history_df["epoch"],
-                history_df["train_loss"],
+                epochs,
+                by_epoch["train_loss"].median(),
                 label="Train MSE",
                 linewidth=2,
             )
 
         if history_df["val_loss"].notna().any():
+            val_median = by_epoch["val_loss"].median()
             ax.plot(
-                history_df["epoch"],
-                history_df["val_loss"],
-                label="Val MSE",
+                epochs,
+                val_median,
+                label="Val MSE (median)" if n_members > 1 else "Val MSE",
                 linewidth=2,
+                color="tab:green",
             )
-            # Mark the lowest-validation-MSE epoch: the point early stopping
-            # selects and whose weights are actually used for prediction.
-            val_history = history_df.dropna(subset=["val_loss"])
-            best_row = val_history.loc[val_history["val_loss"].idxmin()]
-            best_epoch = int(round(best_row["epoch"]))
-            ax.axvline(
-                best_row["epoch"],
-                color="gray",
-                linestyle=":",
-                linewidth=1.2,
-                alpha=0.8,
-            )
-            ax.scatter(
-                [best_row["epoch"]],
-                [best_row["val_loss"]],
-                color="crimson",
-                s=35,
-                zorder=5,
-                label=f"Best epoch ({best_epoch})",
-            )
+
+            if n_members > 1:
+                # Spread across the individual networks at each epoch.
+                ax.fill_between(
+                    epochs,
+                    by_epoch["val_loss"].min(),
+                    by_epoch["val_loss"].max(),
+                    color="tab:green",
+                    alpha=0.18,
+                    linewidth=0,
+                    label=f"Val range ({n_members} nets)",
+                )
+                # Mark where networks start early-stopping: beyond this point the
+                # summary is over a shrinking, self-selected subset, so the tail
+                # is not representative of the full ensemble.
+                active = by_epoch["val_loss"].count()
+                full = active.index[active == n_members]
+                if len(full) and full.max() < epochs.max():
+                    ax.axvline(
+                        full.max(),
+                        color="gray",
+                        linestyle=":",
+                        linewidth=1.2,
+                        alpha=0.9,
+                    )
+
+            # Mark the epoch the models ACTUALLY used: the mean across members of
+            # each member's own best (lowest-validation) epoch. This is not the
+            # minimum of the summary curve, which is biased late by survivorship.
+            if "best_epoch" in history_df.columns:
+                per_member_best = (
+                    history_df.sort_values("epoch")
+                    .groupby("ensemble_member")["best_epoch"]
+                    .last()
+                    .dropna()
+                )
+                if len(per_member_best):
+                    mean_best = float(per_member_best.mean())
+                    nearest = min(epochs, key=lambda e: abs(e - mean_best))
+                    ax.scatter(
+                        [mean_best],
+                        [val_median.loc[nearest]],
+                        color="crimson",
+                        s=34,
+                        zorder=5,
+                        label=f"Mean best epoch ({mean_best:.1f})",
+                    )
 
         ax.set_title(f"Test Year {split_history['test_year']}")
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Objective / MSE")
         ax.grid(True, alpha=0.3)
-        ax.legend()
+        ax.legend(fontsize=7)
 
     for ax in axes[n_plots:]:
         ax.axis("off")
 
-    fig.suptitle(f"{model_name} Learning Curves", fontsize=14)
+    fig.suptitle(
+        f"{model_name} learning curves — median across ensemble members, "
+        "shaded min-max; dotted line = networks begin early-stopping",
+        fontsize=12,
+    )
     fig.tight_layout(rect=[0, 0, 1, 0.97])
 
     output_path = output_dir / f"{model_name.lower()}_learning_curves.png"
@@ -1647,12 +1652,22 @@ def main():
 
         split_eval = summarize_prediction_panel(predictions)
         member_val_losses = _member_val_losses(member_results)
-        averaged_history = _average_member_histories(member_histories)
+        # Save EVERY member's history, not the average. Members early-stop at
+        # different epochs, so an averaged curve is computed over a shrinking,
+        # self-selected subset (only the members still improving survive), and
+        # its tail is not representative of the ensemble. Keeping per-member
+        # rows lets the plot show a median with a min-max band and the true
+        # number of active networks at each epoch.
         learning_history_rows = []
-        for history_entry in averaged_history:
-            history_row = {"test_year": split.test_year}
-            history_row.update(history_entry)
-            learning_history_rows.append(history_row)
+        for member_history in member_histories:
+            for history_entry in member_history["history"]:
+                history_row = {
+                    "test_year": split.test_year,
+                    "ensemble_member": member_history["ensemble_member"],
+                    "seed": member_history["seed"],
+                }
+                history_row.update(history_entry)
+                learning_history_rows.append(history_row)
 
         split_result = {
             "test_year": split.test_year,

@@ -347,7 +347,11 @@ Each experiment writes output files such as:
 - monthly out-of-sample \(R^2\)
 - annual out-of-sample \(R^2\)
 - selected-split learning history with train MSE, train objective, validation
-  MSE, best epoch, and patience counter
+  MSE, best epoch, and patience counter. **One row per (ensemble member, epoch)**
+  — the per-member histories are kept rather than averaged, because members
+  early-stop at different epochs and an averaged curve is computed over a
+  shrinking, self-selected subset (only the members still improving survive), so
+  its tail misrepresents the ensemble
 - decile portfolio performance table with prediction, average return, return
   standard deviation, and annualized Sharpe ratio for deciles 1-10 plus 10-1
 - JSON summary
