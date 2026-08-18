@@ -49,7 +49,8 @@ class FeedForwardNN(nn.Module if nn is not None else object):
         return self.network(x)
 
 
-def build_neural_net(architecture, input_features, batchnorm_after_relu=True):
+def build_neural_net(architecture, input_features, batchnorm_after_relu=True,
+                     verbose=True):
     """
     Build a small family of GKX-style feed-forward networks.
 
@@ -57,6 +58,10 @@ def build_neural_net(architecture, input_features, batchnorm_after_relu=True):
     practical presets that can be swapped from the CLI. ``batchnorm_after_relu``
     controls whether batch normalization is applied after the ReLU (the GKX
     Internet Appendix ordering, and the default) or before it.
+
+    ``verbose`` prints the resolved configuration. Callers that build many
+    identical networks in a loop (the parallel trainer) pass ``verbose=False``
+    to avoid flooding the log with one identical line per network.
     """
     architecture = architecture.upper()
 
@@ -76,11 +81,12 @@ def build_neural_net(architecture, input_features, batchnorm_after_relu=True):
 
     config = configs[architecture]
     bn_order = "after_relu" if batchnorm_after_relu else "before_relu"
-    print(
-        f"Model config -> architecture={architecture}, "
-        f"input_features={input_features}, hidden_layers={config['hidden_layers']}, "
-        f"batchnorm={bn_order}"
-    )
+    if verbose:
+        print(
+            f"Model config -> architecture={architecture}, "
+            f"input_features={input_features}, hidden_layers={config['hidden_layers']}, "
+            f"batchnorm={bn_order}"
+        )
 
     return FeedForwardNN(
         input_features=input_features,

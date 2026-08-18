@@ -342,6 +342,9 @@ def _config_identity(args, tune_learning_rates, tune_l1_lambdas):
         "early_stopping_min_delta": float(args.early_stopping_min_delta),
         "no_shuffle_train": bool(args.no_shuffle_train),
         "shuffle_buffer_batches": args.shuffle_buffer_batches,
+        "parallel_buffered_shuffle": bool(args.parallel_buffered_shuffle),
+        "cache_window": bool(args.cache_window),
+        "val_loss_batch_mean": bool(args.val_loss_batch_mean),
         "max_test_years": args.max_test_years,
         "decile_weight_col": args.decile_weight_col,
     }
@@ -516,6 +519,7 @@ def _train_ensemble_resumable(
                 early_stopping_min_delta=args.early_stopping_min_delta,
                 l1_lambda=l1_lambda,
                 device=device,
+                val_loss_batch_mean=args.val_loss_batch_mean,
             )
             _save_member_checkpoint(
                 path=member_path,
@@ -616,6 +620,11 @@ def _train_ensemble_parallel(
                 batchnorm_after_relu=not args.batchnorm_before_relu,
                 batch_size=args.batch_size,
                 run_self_check=first_group,
+                shuffle_window=(
+                    args.batch_size * args.shuffle_buffer_batches
+                    if args.parallel_buffered_shuffle and not args.no_shuffle_train
+                    else None
+                ),
             )
             first_group = False
             for member_idx, train_result in zip(group, results):
@@ -925,6 +934,17 @@ def _write_outputs(
             "early_stopping_min_delta": args.early_stopping_min_delta,
             "shuffle_train": not args.no_shuffle_train,
             "shuffle_buffer_batches": args.shuffle_buffer_batches,
+            "train_shuffle_scope": (
+                "full_window_permutation"
+                if (args.cache_window
+                    or (args.parallel_nets > 1
+                        and not args.parallel_buffered_shuffle))
+                else "buffered_blocks"
+            ),
+            "validation_loss_metric": (
+                "batch_averaged_mse" if args.val_loss_batch_mean
+                else "row_weighted_pooled_mse"
+            ),
             "validation_years": args.validation_years,
             "test_start_year": completed_years[0],
             "test_end_year": completed_years[-1],
@@ -1409,6 +1429,41 @@ def main():
         help="Number of streamed batches to hold before shuffling training rows.",
     )
     parser.add_argument(
+        "--cache_window",
+        action="store_true",
+        help=(
+            "Hold each window's raw columns in RAM instead of re-reading the "
+            "Parquet file every epoch, and draw training batches by permuting "
+            "the whole window rather than a streaming buffer. This is the "
+            "sampling scheme GKX describe in Internet Appendix B.3. Only the "
+            "94 characteristics, 8 macros, 74 dummies and target are cached; "
+            "the 920-column design matrix is still rebuilt per batch, so the "
+            "largest training window costs about 1.3 GB rather than 9.7 GB. "
+            "--shuffle_buffer_batches has no effect when this is set."
+        ),
+    )
+    parser.add_argument(
+        "--parallel_buffered_shuffle",
+        action="store_true",
+        help=(
+            "With --parallel_nets, restrict shuffling to consecutive blocks of "
+            "batch_size * shuffle_buffer_batches rows, reproducing the streaming "
+            "CPU path. The default is a full permutation of the training window, "
+            "which the in-memory parallel trainer can afford and which decorrelates "
+            "batches that the date-ordered panel would otherwise leave "
+            "time-clustered. Use this flag to measure that difference."
+        ),
+    )
+    parser.add_argument(
+        "--val_loss_batch_mean",
+        action="store_true",
+        help=(
+            "Compute validation loss as the unweighted mean of per-batch MSEs "
+            "instead of the row-weighted pooled MSE. This over-weights a short "
+            "final batch and is kept only to reproduce runs made before the fix."
+        ),
+    )
+    parser.add_argument(
         "--max_test_years",
         type=int,
         default=None,
@@ -1607,12 +1662,14 @@ def main():
             date_end=split.train_end,
             shuffle=not args.no_shuffle_train,
             shuffle_buffer_batches=args.shuffle_buffer_batches,
+            cache_window=args.cache_window,
         )
         val_generator = GKXDataGenerator(
             filepath=args.data_path,
             batch_size=args.batch_size,
             date_start=split.val_start,
             date_end=split.val_end,
+            cache_window=args.cache_window,
         )
         test_generator = GKXDataGenerator(
             filepath=args.data_path,

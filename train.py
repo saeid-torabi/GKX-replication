@@ -50,12 +50,25 @@ def _l1_penalty(model, device):
     return penalty
 
 
-def evaluate_loss(model, generator, device):
-    """Mean predictive MSE over ``generator`` (no regularization)."""
+def evaluate_loss(model, generator, device, batch_mean=False):
+    """Predictive MSE over ``generator`` (no regularization).
+
+    By default this is the *row-weighted* pooled MSE, sum of squared errors
+    divided by the number of rows. That is the quantity the parallel trainer
+    computes, so both execution paths select hyperparameters on the same metric.
+
+    ``batch_mean=True`` restores the earlier behaviour: the unweighted mean of
+    per-batch MSEs. That over-weights a short final batch by the ratio of the
+    full batch size to its actual length -- for a 782,635-row validation window
+    at batch 10,000 the last 2,635 rows carry 1/79 of the weight instead of
+    0.34%, a factor of 3.8. Kept only to reproduce runs made before the fix.
+    """
     model.eval()
     loss_fn = torch.nn.MSELoss()
     running_loss = 0.0
     batches_seen = 0
+    squared_error = 0.0
+    rows_seen = 0
 
     with torch.no_grad():
         for batch in generator:
@@ -64,10 +77,16 @@ def evaluate_loss(model, generator, device):
             y_batch = y_batch.to(device)
 
             predictions = model(x_batch)
-            running_loss += loss_fn(predictions, y_batch).item()
-            batches_seen += 1
+            if batch_mean:
+                running_loss += loss_fn(predictions, y_batch).item()
+                batches_seen += 1
+            else:
+                squared_error += ((predictions - y_batch) ** 2).sum().item()
+                rows_seen += y_batch.numel()
 
-    return running_loss / batches_seen
+    if batch_mean:
+        return running_loss / batches_seen
+    return squared_error / rows_seen
 
 
 def train_model(
@@ -80,6 +99,7 @@ def train_model(
     early_stopping_patience=5,
     early_stopping_min_delta=0.0,
     l1_lambda=1e-5,
+    val_loss_batch_mean=False,
 ):
     """Fit one network with Adam on an MSE + L1 objective, keeping the best
     epoch by validation loss and supporting early stopping.
@@ -135,7 +155,8 @@ def train_model(
         train_l1_penalty = running_l1_penalty / batches_seen
 
         if val_generator is not None:
-            val_loss = evaluate_loss(model, val_generator, device)
+            val_loss = evaluate_loss(model, val_generator, device,
+                                     batch_mean=val_loss_batch_mean)
             selection_metric = val_loss
         else:
             val_loss = None

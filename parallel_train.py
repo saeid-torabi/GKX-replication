@@ -116,6 +116,28 @@ def _vectorized_forward(layers, params, buffers, x, training):
     return out
 
 
+def _member_permutation(n, generator, device, shuffle_window=None):
+    """Row order for one epoch of one member.
+
+    With ``shuffle_window=None`` (the default) this is a full global permutation
+    of the training window. With an integer window it reproduces the streaming
+    generator's *buffered* shuffle, which only permutes within consecutive
+    blocks of ``batch_size * shuffle_buffer_batches`` rows. Because the panel is
+    stored in date order, the buffered variant yields time-clustered batches;
+    the full permutation does not. The two therefore train differently, and the
+    window argument exists so the difference can be measured rather than
+    silently assumed away.
+    """
+    if not shuffle_window:
+        return torch.randperm(n, generator=generator, device=device)
+    blocks = []
+    for start in range(0, n, shuffle_window):
+        size = min(shuffle_window, n - start)
+        blocks.append(start + torch.randperm(size, generator=generator,
+                                             device=device))
+    return torch.cat(blocks)
+
+
 def _l1_weight_penalty(params):
     """Per-net L1 over weight tensors only (per-net ndim>1: the Linear weights,
     stacked as (K, out, in)). Returns (K,)."""
@@ -132,7 +154,8 @@ def parallel_self_check(architecture, input_features, batchnorm_after_relu,
     """Verify the vectorized forward+backward matches reference nn.Modules.
     Raises AssertionError on mismatch. Cheap; run once before real training."""
     torch.manual_seed(0)
-    models = [build_neural_net(architecture, input_features, batchnorm_after_relu)
+    models = [build_neural_net(architecture, input_features, batchnorm_after_relu,
+                               verbose=False)
               for _ in range(k)]
     for m in models:
         m.to(device).train()
@@ -203,10 +226,17 @@ def train_parallel_members(
     batchnorm_after_relu=True,
     batch_size=10000,
     run_self_check=True,
+    progress=True,
+    shuffle_window=None,
 ):
     """Train K networks (same lr/lambda, distinct seeds) concurrently. Returns a
     list of train_result dicts matching train.train_model's output, one per
-    member, in the order of member_specs."""
+    member, in the order of member_specs.
+
+    ``progress`` prints one flushed '.' per completed epoch, matching the
+    heartbeat in train.train_model. Note the dot rate differs by design: the
+    sequential trainer emits one dot per epoch *per network*, whereas here one
+    dot covers an epoch for the whole group of K networks trained together."""
     if torch is None:
         raise ImportError("torch is required for parallel training.") \
             from _TORCH_IMPORT_ERROR
@@ -221,7 +251,8 @@ def train_parallel_members(
     for _, seed in member_specs:
         _seed_everything(seed)
         models.append(
-            build_neural_net(architecture, input_features, batchnorm_after_relu)
+            build_neural_net(architecture, input_features, batchnorm_after_relu,
+                             verbose=False)
             .to(device)
         )
     layers = _describe_layers(models[0])
@@ -250,7 +281,7 @@ def train_parallel_members(
     for epoch in range(1, epochs + 1):
         # Per-member permutation of the shared training rows.
         perms = torch.stack(
-            [torch.randperm(n_train, generator=generators[i], device=device)
+            [_member_permutation(n_train, generators[i], device, shuffle_window)
              for i in range(k)],
             dim=0,
         )  # (K, N)
@@ -269,7 +300,12 @@ def train_parallel_members(
             mse = ((preds.squeeze(-1) - yb) ** 2).mean(dim=1)     # (K,)
             l1 = _l1_weight_penalty(params)                       # (K,)
             per_net = mse + l1_lambda * l1
-            # Only still-active members contribute gradients.
+            # Only still-active members contribute gradients. Note that a
+            # stopped member's parameters can still drift slightly, because
+            # Adam's momentum terms decay rather than vanish, and its batch-norm
+            # buffers keep tracking. This is harmless: every member is restored
+            # from the snapshot taken at its own best epoch (see best_state
+            # below), so post-stop drift never reaches the returned model.
             active = torch.tensor([0.0 if s else 1.0 for s in stopped],
                                   device=device, dtype=per_net.dtype)
             loss = (per_net * active).sum()
@@ -300,6 +336,11 @@ def train_parallel_members(
                                          training=False)
                 sse += ((vp.squeeze(-1) - vy.unsqueeze(0)) ** 2).sum(dim=1)
             val_mse = sse / n_val               # (K,)
+
+        # Heartbeat: one flushed mark per completed epoch, mirroring
+        # train.train_model, so a long GPU run visibly shows it is alive.
+        if progress:
+            print(".", end="", flush=True)
 
         for i in range(k):
             if stopped[i]:
