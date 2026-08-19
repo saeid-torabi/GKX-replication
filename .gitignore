@@ -21,7 +21,5 @@ __pycache__/
 *.html
 
 # Auxiliary dev / diagnostic scripts (not part of the core pipeline)
-test_checkpoint_logic.py
 smoke_test_checkpoints.py
 profile_pipeline.py
-test_data_generator.py
