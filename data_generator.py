@@ -49,8 +49,6 @@ class GKXDataGenerator:
         return_metadata=False,
         metadata_cols=None,
         shuffle=False,
-        shuffle_buffer_batches=8,
-        cache_window=False,
     ):
         if pq is None or ds is None:
             raise ImportError(
@@ -72,12 +70,6 @@ class GKXDataGenerator:
         self.return_metadata = return_metadata
         self.metadata_cols = metadata_cols or [date_col, "permno"]
         self.shuffle = shuffle
-        self.shuffle_buffer_batches = shuffle_buffer_batches
-        if self.shuffle and self.shuffle_buffer_batches < 1:
-            raise ValueError("shuffle_buffer_batches must be at least 1 when shuffle=True.")
-        # When the window is cached in RAM, shuffling is a full permutation of
-        # every row, so the buffer size is irrelevant and deliberately ignored.
-        self.cache_window = cache_window
         self._cache = None
 
         # Read schema once from parquet metadata, but iterate through a dataset
@@ -100,18 +92,12 @@ class GKXDataGenerator:
         )
 
         window = f"{self.date_start or '-inf'}-{self.date_end or '+inf'}"
-        if self.shuffle and self.cache_window:
-            shuffle_note = ", shuffle full"
-        elif self.shuffle:
-            shuffle_note = f", shuffle x{self.shuffle_buffer_batches}"
-        else:
-            shuffle_note = ""
-        if self.cache_window:
-            raw_bytes = self.total_rows * (
-                len(self.char_cols) * 4 + len(self.macro_cols) * 4
-                + len(self.dummy_cols) + 4
-            )
-            shuffle_note += f", cached {raw_bytes / 1024 ** 3:.2f} GB"
+        raw_bytes = self.total_rows * (
+            len(self.char_cols) * 4 + len(self.macro_cols) * 4
+            + len(self.dummy_cols) + 4
+        )
+        shuffle_note = ", shuffled" if self.shuffle else ""
+        shuffle_note += f", cached {raw_bytes / 1024 ** 3:.2f} GB"
         print(
             f"  [data] {window}: {self.total_rows:,} rows, "
             f"{self.num_features} features, batch {self.batch_size:,}{shuffle_note}"
@@ -191,6 +177,11 @@ class GKXDataGenerator:
         columns is what makes a full permutation of the window affordable on a
         small machine, and it also removes the repeated Parquet decode that
         otherwise happens once per epoch per network.
+
+        Feature integrity is checked here, once per window, rather than on every
+        assembled batch: the 920 columns are built by multiplication from these
+        raw values, so a NaN can only reach the design matrix by being present
+        in one of them.
         """
         scanner = self.dataset.scanner(
             columns=self._columns_to_read(),
@@ -219,6 +210,35 @@ class GKXDataGenerator:
             "meta": (pd.concat(metas, ignore_index=True)
                      if self.return_metadata else None),
         }
+
+        # One finite-sum reduction per block. Any NaN or infinity propagates
+        # into the total, so a finite sum proves the whole block is clean --
+        # a single pass with no temporary allocation, about 3 seconds across a
+        # full 30-year run. The per-column diagnosis runs only on failure, so
+        # its cost is never paid by a healthy dataset.
+        for name, cols in (("chars", self.char_cols),
+                           ("macros", self.macro_cols),
+                           ("y", [self.target_col])):
+            block = self._cache[name]
+            if np.isfinite(block.sum()):
+                continue
+            flat = block.reshape(block.shape[0], -1)
+            offenders = [c for c, ok in zip(cols, np.isfinite(flat).all(axis=0))
+                         if not ok]
+            raise ValueError(
+                f"Non-finite values in {name} for window "
+                f"{self.date_start}-{self.date_end}.\n"
+                f"Columns affected: {offenders}"
+            )
+
+    def release_cache(self):
+        """Drop the cached window.
+
+        The GPU path copies an expanded copy of the window onto the device, so
+        holding the raw cache afterwards would keep ~1.3 GB of host RAM alive
+        for no reason.
+        """
+        self._cache = None
 
     def _assemble(self, row_index):
         """Build one batch of the 920-column design matrix from cached raw rows.
@@ -254,139 +274,35 @@ class GKXDataGenerator:
             yield self._assemble(batch_index)
 
     def _iter_ordered_batches(self):
+        """Yield batches in the panel's stored (date) order.
+
+        Used for validation, prediction, and by the GPU path when it copies a
+        whole window to the device. Training uses ``__iter__`` instead.
         """
-        Yield one ordered batch of PyTorch tensors at a time.
-        """
-        if self.cache_window:
-            if self._cache is None:
-                self._build_cache()
-            yield from self._iter_cached_batches(
-                np.arange(self._cache["y"].shape[0])
-            )
-            return
-
-        columns_to_read = (
-            self.char_cols
-            + self.macro_cols
-            + self.dummy_cols
-            + [self.target_col]
-            + self.metadata_cols
+        if self._cache is None:
+            self._build_cache()
+        yield from self._iter_cached_batches(
+            np.arange(self._cache["y"].shape[0])
         )
-        # Preserve order and remove duplicates.
-        columns_to_read = list(dict.fromkeys(columns_to_read))
-
-        scanner = self.dataset.scanner(
-            columns=columns_to_read,
-            filter=self.filter_expression,
-            batch_size=self.batch_size,
-        )
-
-        for batch in scanner.to_batches():
-            df_chunk = batch.to_pandas()
-            current_batch_size = len(df_chunk)
-            if current_batch_size == 0:
-                continue
-
-            chars_array = df_chunk[self.char_cols].to_numpy(dtype=np.float32, copy=False)
-            macros_array = df_chunk[self.macro_cols].to_numpy(dtype=np.float32, copy=False)
-            dummies_array = df_chunk[self.dummy_cols].to_numpy(dtype=np.float32, copy=False)
-            targets_array = df_chunk[self.target_col].to_numpy(dtype=np.float32, copy=False)
-
-            # Broadcast (batch, 94, 1) against (batch, 1, 8) to produce
-            # the 94 x 8 interaction block for the current chunk only.
-            interactions_array = (
-                chars_array[:, :, None] * macros_array[:, None, :]
-            ).reshape(current_batch_size, -1)
-
-            x_final = np.concatenate(
-                [chars_array, interactions_array, dummies_array],
-                axis=1,
-            )
-
-            if np.isnan(x_final).any():
-                source_cols = self.char_cols + self.macro_cols + self.dummy_cols
-                source_nan_counts = df_chunk[source_cols].isna().sum()
-                source_nan_counts = source_nan_counts[
-                    source_nan_counts > 0
-                ].sort_values(ascending=False)
-
-                raise ValueError(
-                    "NaNs detected in feature matrix before tensor conversion.\n"
-                    f"Source columns with NaNs:\n{source_nan_counts}"
-                )
-
-            if np.isnan(targets_array).any():
-                raise ValueError(
-                    f"NaNs detected in target column '{self.target_col}' "
-                    "before tensor conversion."
-                )
-
-            x_tensor = torch.from_numpy(x_final)
-            y_tensor = torch.from_numpy(targets_array).view(-1, 1)
-
-            if self.return_metadata:
-                metadata_df = df_chunk[self.metadata_cols].reset_index(drop=True)
-                yield x_tensor, y_tensor, metadata_df
-            else:
-                yield x_tensor, y_tensor
-
-    def _flush_shuffle_buffer(self, buffer):
-        if self.return_metadata:
-            x_tensor = torch.cat([item[0] for item in buffer], dim=0)
-            y_tensor = torch.cat([item[1] for item in buffer], dim=0)
-            metadata_df = pd.concat([item[2] for item in buffer], ignore_index=True)
-        else:
-            x_tensor = torch.cat([item[0] for item in buffer], dim=0)
-            y_tensor = torch.cat([item[1] for item in buffer], dim=0)
-            metadata_df = None
-
-        permutation = torch.randperm(x_tensor.shape[0])
-        for start in range(0, x_tensor.shape[0], self.batch_size):
-            batch_index = permutation[start:start + self.batch_size]
-            if batch_index.numel() < 2:
-                continue
-            if self.return_metadata:
-                batch_metadata = metadata_df.iloc[batch_index.numpy()].reset_index(drop=True)
-                yield x_tensor[batch_index], y_tensor[batch_index], batch_metadata
-            else:
-                yield x_tensor[batch_index], y_tensor[batch_index]
 
     def __iter__(self):
+        """Yield one batch of PyTorch tensors at a time.
+
+        When ``shuffle`` is set, each epoch draws a fresh permutation of every
+        row in the window -- GKX Internet Appendix B.3: "At each step of
+        training, a batch sent to the algorithm is randomly sampled from the
+        training dataset." Because the panel is stored in date order, anything
+        narrower than a full permutation would hand the optimizer batches drawn
+        from a few adjacent months, leaving gradients serially correlated and
+        the batch-norm running statistics dominated by whichever months happened
+        to come last.
         """
-        Yield one batch of PyTorch tensors at a time.
-        """
-        if not self.shuffle:
-            yield from self._iter_ordered_batches()
-            return
-
-        if self.cache_window:
-            # GKX Internet Appendix B.3: "At each step of training, a batch sent
-            # to the algorithm is randomly sampled from the training dataset."
-            # With the window in RAM this is a genuine permutation of every row,
-            # so batches mix the whole training period instead of the handful of
-            # adjacent months a streaming buffer can hold. shuffle_buffer_batches
-            # plays no role here.
-            if self._cache is None:
-                self._build_cache()
-            n_rows = self._cache["y"].shape[0]
-            yield from self._iter_cached_batches(
-                torch.randperm(n_rows).numpy()
-            )
-            return
-
-        buffer = []
-        buffered_rows = 0
-        flush_threshold = self.batch_size * self.shuffle_buffer_batches
-        for item in self._iter_ordered_batches():
-            buffer.append(item)
-            buffered_rows += item[0].shape[0]
-            if buffered_rows >= flush_threshold:
-                yield from self._flush_shuffle_buffer(buffer)
-                buffer = []
-                buffered_rows = 0
-
-        if buffer:
-            yield from self._flush_shuffle_buffer(buffer)
+        if self._cache is None:
+            self._build_cache()
+        n_rows = self._cache["y"].shape[0]
+        order = (torch.randperm(n_rows).numpy() if self.shuffle
+                 else np.arange(n_rows))
+        yield from self._iter_cached_batches(order)
 
     def __len__(self):
         """

@@ -116,28 +116,6 @@ def _vectorized_forward(layers, params, buffers, x, training):
     return out
 
 
-def _member_permutation(n, generator, device, shuffle_window=None):
-    """Row order for one epoch of one member.
-
-    With ``shuffle_window=None`` (the default) this is a full global permutation
-    of the training window. With an integer window it reproduces the streaming
-    generator's *buffered* shuffle, which only permutes within consecutive
-    blocks of ``batch_size * shuffle_buffer_batches`` rows. Because the panel is
-    stored in date order, the buffered variant yields time-clustered batches;
-    the full permutation does not. The two therefore train differently, and the
-    window argument exists so the difference can be measured rather than
-    silently assumed away.
-    """
-    if not shuffle_window:
-        return torch.randperm(n, generator=generator, device=device)
-    blocks = []
-    for start in range(0, n, shuffle_window):
-        size = min(shuffle_window, n - start)
-        blocks.append(start + torch.randperm(size, generator=generator,
-                                             device=device))
-    return torch.cat(blocks)
-
-
 def _l1_weight_penalty(params):
     """Per-net L1 over weight tensors only (per-net ndim>1: the Linear weights,
     stacked as (K, out, in)). Returns (K,)."""
@@ -227,7 +205,6 @@ def train_parallel_members(
     batch_size=10000,
     run_self_check=True,
     progress=True,
-    shuffle_window=None,
 ):
     """Train K networks (same lr/lambda, distinct seeds) concurrently. Returns a
     list of train_result dicts matching train.train_model's output, one per
@@ -279,9 +256,10 @@ def train_parallel_members(
         return state
 
     for epoch in range(1, epochs + 1):
-        # Per-member permutation of the shared training rows.
+        # Fresh full permutation per member, per epoch: each network sees every
+        # row once, in its own order.
         perms = torch.stack(
-            [_member_permutation(n_train, generators[i], device, shuffle_window)
+            [torch.randperm(n_train, generator=generators[i], device=device)
              for i in range(k)],
             dim=0,
         )  # (K, N)
@@ -402,9 +380,12 @@ def _seed_everything(seed):
 
 
 def materialize_dataset(generator, device):
-    """Stack all rows of a GKXDataGenerator into device tensors (X, y). Uses the
-    ordered iterator (not the shuffle buffer) so every row is included exactly
-    once; each member re-shuffles independently during training."""
+    """Stack all rows of a GKXDataGenerator into device tensors (X, y).
+
+    Uses the ordered iterator so every row is included exactly once; each member
+    re-shuffles independently during training. The generator's raw-column cache
+    is released afterwards, since the expanded copy now lives on the device and
+    keeping both would hold ~1.3 GB of host RAM for nothing."""
     if hasattr(generator, "_iter_ordered_batches"):
         iterator = generator._iter_ordered_batches()
     else:
@@ -415,4 +396,6 @@ def materialize_dataset(generator, device):
         ys.append(batch[1].reshape(-1))
     x = torch.cat(xs, dim=0).to(device)
     y = torch.cat(ys, dim=0).to(device)
+    if hasattr(generator, "release_cache"):
+        generator.release_cache()
     return x, y
