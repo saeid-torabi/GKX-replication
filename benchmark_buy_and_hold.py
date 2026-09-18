@@ -48,8 +48,18 @@ except ImportError:            # pragma: no cover - depends on the environment
 
 RUN = Path(sys.argv[1] if len(sys.argv) > 1
            else "outputs/nn1_cache_shufflefix_1987_2016")
-FF = Path("data_csv/ff3.csv")
+# ff5.csv carries all six factors (mktrf, smb, hml, rmw, cma, umd) from
+# 1963-07, so it covers the whole 1987-2016 test window. ff3.csv lacks rmw and
+# cma and is used only as a fallback, in which case FF6 is skipped.
+FF = Path("data_in_case_needed/ff5.csv")
+FF_FALLBACK = Path("data_csv/ff3.csv")
 PREFIX = "nn1"
+
+FACTOR_MODELS = [
+    ("CAPM", ["mktrf"]),
+    ("FF3", ["mktrf", "smb", "hml"]),
+    ("FF6", ["mktrf", "smb", "hml", "rmw", "cma", "umd"]),
+]
 
 
 def newey_west_tstat(y, X, lags=None):
@@ -140,10 +150,23 @@ series = market.merge(longshort[["YYYYMM", "1", "10", "long_short_10_1"]],
                       on="YYYYMM")
 
 # --------------------------------------------------------- Fama-French merge
-ff = pd.read_csv(FF)
+ff_path = FF if FF.exists() else FF_FALLBACK
+ff = pd.read_csv(ff_path)
 ff["YYYYMM"] = (pd.to_datetime(ff["dateff"]).dt.year * 100
                 + pd.to_datetime(ff["dateff"]).dt.month)
-series = series.merge(ff[["YYYYMM", "mktrf", "smb", "hml", "rf"]], on="YYYYMM")
+available = [c for c in ["mktrf", "smb", "hml", "rmw", "cma", "umd", "rf"]
+             if c in ff.columns]
+series = series.merge(ff[["YYYYMM"] + available], on="YYYYMM")
+
+models = [(name, cols) for name, cols in FACTOR_MODELS
+          if all(c in available for c in cols)]
+print(f"factors: {ff_path.name} -> {', '.join(c for c in available if c != 'rf')}")
+fitted = {name for name, _ in models}
+if len(models) < len(FACTOR_MODELS):
+    skipped = [name for name, _ in FACTOR_MODELS if name not in fitted]
+    missing = sorted({c for _, cols in FACTOR_MODELS for c in cols}
+                     - set(available))
+    print(f"         missing {missing} -> {', '.join(skipped)} skipped")
 print(f"months : {len(series)}  (after merging Fama-French)\n")
 
 # -------------------------------------------------------------------- report
@@ -158,23 +181,22 @@ portfolios = [
 ]
 for label, col in portfolios:
     r = series[col].to_numpy()
-    capm_b, capm_t, capm_p = newey_west_tstat(r, series[["mktrf"]].to_numpy())
-    ff3_b, ff3_t, ff3_p = newey_west_tstat(
-        r, series[["mktrf", "smb", "hml"]].to_numpy())
-    rows.append({
+    row = {
         "portfolio": label,
         "mean_pct": r.mean() * 100,
         "sd_pct": r.std(ddof=1) * 100,
         "sharpe": annualized_sharpe_ratio(pd.Series(r)),
-        "capm_alpha_pct": capm_b[0] * 100,
-        "capm_t": capm_t[0],
-        "capm_p": capm_p[0],
-        "capm_beta": capm_b[1],
-        "ff3_alpha_pct": ff3_b[0] * 100,
-        "ff3_t": ff3_t[0],
-        "ff3_p": ff3_p[0],
         **performance_profile(r),
-    })
+    }
+    for name, cols in models:
+        beta, tstat, pval = newey_west_tstat(r, series[cols].to_numpy())
+        key = name.lower()
+        row[f"{key}_alpha_pct"] = beta[0] * 100
+        row[f"{key}_t"] = tstat[0]
+        row[f"{key}_p"] = pval[0]
+        for j, factor in enumerate(cols, start=1):
+            row[f"{key}_b_{factor}"] = beta[j]
+    rows.append(row)
 
 out = pd.DataFrame(rows)
 
@@ -183,33 +205,67 @@ def stars(p):
     return "***" if p < 0.01 else ("**" if p < 0.05 else ("*" if p < 0.10 else ""))
 
 
-print("PANEL A -- risk, return and risk-adjusted performance")
-hdr = (f"{'Portfolio':<28}{'Mean%':>8}{'SD%':>7}{'SR':>7}"
-       f"{'CAPM a%':>9}{'(t)':>7}{'p':>8}{'beta':>7}"
-       f"{'FF3 a%':>9}{'(t)':>7}{'p':>8}")
+print("PANEL A -- return, risk and cumulative growth")
+hdr = (f"{'Portfolio':<28}{'Mean%':>8}{'SD%':>7}{'SR':>7}{'$1 becomes':>12}"
+       f"{'maxDD%':>9}{'best%':>8}{'worst%':>9}{'%up':>7}")
 print(hdr)
 print("-" * len(hdr))
 for _, r in out.iterrows():
     print(f"{r.portfolio:<28}{r.mean_pct:8.3f}{r.sd_pct:7.2f}{r.sharpe:7.3f}"
-          f"{r.capm_alpha_pct:9.3f}{r.capm_t:7.2f}{r.capm_p:8.4f}{r.capm_beta:7.2f}"
-          f"{r.ff3_alpha_pct:9.3f}{r.ff3_t:7.2f}{r.ff3_p:8.4f}")
-print(f"\n  significance of the CAPM alpha:  "
-      + "   ".join(f"{r.portfolio.split(',')[0]}{stars(r.capm_p)}"
-                   for _, r in out.iterrows() if stars(r.capm_p)))
-print("  *** p<0.01  ** p<0.05  * p<0.10   (Newey-West, "
-      + ("Student-t)" if _scipy_stats is not None else "normal approximation)"))
-
-print("\nPANEL B -- cumulative growth and tail behaviour")
-hdr2 = (f"{'Portfolio':<28}{'$1 becomes':>12}{'max DD%':>9}"
-        f"{'best mo%':>10}{'worst mo%':>11}{'% months up':>13}")
-print(hdr2)
-print("-" * len(hdr2))
-for _, r in out.iterrows():
-    print(f"{r.portfolio:<28}{r.growth_of_1:11.2f}x{r.max_drawdown_pct:9.1f}"
-          f"{r.best_month_pct:10.1f}{r.worst_month_pct:11.1f}"
-          f"{r.pct_months_positive:13.1f}")
+          f"{r.growth_of_1:11.2f}x{r.max_drawdown_pct:9.1f}"
+          f"{r.best_month_pct:8.1f}{r.worst_month_pct:9.1f}"
+          f"{r.pct_months_positive:7.1f}")
 print("\n  Wealth compounds EXCESS returns, i.e. growth above cash, so the")
 print("  long-only and self-financing portfolios stay comparable.")
+
+print("\nPANEL B -- factor-adjusted alphas (%/month, Newey-West)")
+hdr = f"{'Portfolio':<28}" + "".join(
+    f"{name + ' a%':>9}{'(t)':>7}{'p':>8}" for name, _ in models)
+print(hdr)
+print("-" * len(hdr))
+for _, r in out.iterrows():
+    line = f"{r.portfolio:<28}"
+    for name, _ in models:
+        k = name.lower()
+        line += (f"{r[f'{k}_alpha_pct']:9.3f}{r[f'{k}_t']:7.2f}"
+                 f"{r[f'{k}_p']:8.4f}")
+    print(line)
+print("\n  *** p<0.01  ** p<0.05  * p<0.10  (" +
+      ("Student-t)" if _scipy_stats is not None else "normal approximation)"))
+for _, r in out.iterrows():
+    marks = "  ".join(f"{name} {stars(r[f'{name.lower()}_p']) or 'ns'}"
+                      for name, _ in models)
+    print(f"    {r.portfolio:<28}{marks}")
+
+if "FF6" in fitted:
+    ff6_cols = dict(models)["FF6"]
+    print("\nPANEL C -- FF6 factor loadings")
+    print("  Whether a portfolio's alpha is genuinely new information or just")
+    print("  exposure to size, value, profitability, investment or momentum.")
+    hdr = f"{'Portfolio':<28}" + "".join(f"{c:>9}" for c in ff6_cols)
+    print(hdr)
+    print("-" * len(hdr))
+    for _, r in out.iterrows():
+        print(f"{r.portfolio:<28}"
+              + "".join(f"{r[f'ff6_b_{c}']:9.2f}" for c in ff6_cols))
+
+# ---------------------------------------- where does the long-short alpha come from
+print("\nDECOMPOSITION -- long-short alpha by leg")
+d10 = out[out.portfolio.str.contains("decile 10")].iloc[0]
+d1 = out[out.portfolio.str.contains("decile 1$|decile 1\\b", regex=True)].iloc[0]
+print(f"{'Model':<8}{'long leg':>11}{'short leg':>12}{'total':>10}"
+      f"{'long share':>13}{'short share':>14}")
+print("-" * 68)
+for name, _ in models:
+    k = name.lower()
+    a_long, a_short = d10[f"{k}_alpha_pct"], -d1[f"{k}_alpha_pct"]
+    total = a_long + a_short
+    print(f"{name:<8}{a_long:11.3f}{a_short:12.3f}{total:10.3f}"
+          f"{a_long / total * 100:12.1f}%{a_short / total * 100:13.1f}%")
+print("\n  Avramov, Cheng & Metzker (2023) report the GKX long leg at 0.77%/month")
+print("  FF6-adjusted and the short leg insignificant at -0.15%. Compare the FF6")
+print("  row above: a CAPM decomposition can attribute to the short leg what is")
+print("  really exposure to size and momentum.")
 
 worst = series.long_short_10_1.idxmin()
 print(f"\n  long-short's worst month: {series.YYYYMM[worst]}  "
